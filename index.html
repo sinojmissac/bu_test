@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>V5000 MBU Test</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a232c;
+      --ink: #e8eef4;
+      --muted: #8fa3b5;
+      --accent: #3d9cf0;
+      --ok: #3dcc8a;
+      --err: #ff6b6b;
+      --line: #2a3845;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.4 system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      padding: 16px 16px 32px;
+    }
+    h1 { font-size: 1.15rem; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 0.85rem; margin-bottom: 16px; }
+    .status {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      font-size: 0.9rem;
+    }
+    .status.ok { border-color: var(--ok); }
+    .status.err { border-color: var(--err); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    button {
+      background: var(--accent);
+      color: #061018;
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.ghost {
+      background: var(--card);
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .grid button { width: 100%; }
+    pre {
+      background: #0a0e12;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+      overflow: auto;
+      min-height: 140px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+    }
+    .hint { color: var(--muted); font-size: 0.8rem; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>V5000 MBU Test</h1>
+  <div class="sub">Scan → connect → ping → MBU connect (accept on badge) → pull data</div>
+  <div id="status" class="status">Disconnected. Chrome on Android or desktop; iOS Safari has no Web Bluetooth.</div>
+  <div class="row">
+    <button id="connect">Connect to badge</button>
+    <button id="disconnect" class="ghost" disabled>Disconnect</button>
+  </div>
+  <div class="grid">
+    <button data-action="PING" disabled>Ping</button>
+    <button data-action="MBUCONNECT" disabled>MBU connect</button>
+    <button data-action="MBUBASICINFO" disabled>Basic info</button>
+    <button data-action="MBUIPINFO" disabled>IP info</button>
+    <button data-action="MBUSERVERINFO" disabled>Server info</button>
+    <button data-action="MBUWLANINFO1" disabled>WLAN 1</button>
+    <button data-action="MBUWLANINFO2" disabled>WLAN 2</button>
+    <button data-action="MBUMULTICASTINFO" disabled>Multicast</button>
+    <button data-action="MBUDISCONNECT" disabled>MBU disconnect</button>
+  </div>
+  <pre id="log">Ready.</pre>
+  <p class="hint">
+    Badge needs <code>SmartphoneBluetoothPairing=true</code> and advertising.
+    After MBU connect, tap OK on the badge. Web Bluetooth needs HTTPS or localhost
+    (on a phone, copy this file to a host with HTTPS, or use Chrome on a PC with Bluetooth).
+  </p>
+
+  <script>
+    const SERVICE = "ef16b600-9c17-455c-819a-4ce618569300";
+    const CHAR = "ef16b601-9c17-455c-819a-4ce618569300";
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+
+    let device = null;
+    let characteristic = null;
+
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const connectBtn = document.getElementById("connect");
+    const disconnectBtn = document.getElementById("disconnect");
+    const actionBtns = document.querySelectorAll("button[data-action]");
+
+    function setStatus(text, kind) {
+      statusEl.textContent = text;
+      statusEl.className = "status" + (kind ? " " + kind : "");
+    }
+
+    function log(label, data) {
+      const time = new Date().toISOString().slice(11, 19);
+      let body = data;
+      if (typeof data === "string") {
+        try { body = JSON.stringify(JSON.parse(data), null, 2); } catch (_) {}
+      }
+      logEl.textContent = `[${time}] ${label}\n${body}`;
+    }
+
+    function setConnected(on) {
+      connectBtn.disabled = on;
+      disconnectBtn.disabled = !on;
+      actionBtns.forEach((b) => { b.disabled = !on; });
+    }
+
+    function onNotify(event) {
+      const text = decoder.decode(event.target.value);
+      log("Notify", text);
+      try {
+        const json = JSON.parse(text);
+        if (json.action === "MBUCONNECT") {
+          const status = (json.slots || []).find((s) => s.key === "status");
+          if (status && status.value === "ok") {
+            setStatus("MBU session accepted. Pull data.", "ok");
+          } else {
+            setStatus("MBU connect declined or failed.", "err");
+          }
+        }
+      } catch (_) {}
+    }
+
+    function onDisconnected() {
+      if (characteristic) {
+        characteristic.removeEventListener("characteristicvaluechanged", onNotify);
+      }
+      characteristic = null;
+      device = null;
+      setConnected(false);
+      setStatus("Disconnected", "err");
+    }
+
+    async function connect() {
+      if (!navigator.bluetooth) {
+        setStatus("Web Bluetooth not available in this browser.", "err");
+        return;
+      }
+      try {
+        setStatus("Pick the V5000 in the chooser…");
+        device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [SERVICE] }],
+          optionalServices: [SERVICE]
+        });
+        device.addEventListener("gattserverdisconnected", onDisconnected);
+        setStatus("Connecting GATT…");
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE);
+        characteristic = await service.getCharacteristic(CHAR);
+        await characteristic.startNotifications();
+        characteristic.addEventListener("characteristicvaluechanged", onNotify);
+        setConnected(true);
+        setStatus("Connected to " + (device.name || "V5000") + ". Start with Ping.", "ok");
+        log("Connected", device.name || device.id);
+      } catch (err) {
+        setStatus(err.message || String(err), "err");
+        log("Connect failed", err.message || String(err));
+      }
+    }
+
+    async function disconnect() {
+      try { device && device.gatt && device.gatt.disconnect(); } catch (_) {}
+      onDisconnected();
+    }
+
+    async function send(action) {
+      if (!characteristic) return;
+      const payload = JSON.stringify({ action, slots: [] });
+      log("Write", payload);
+      if (action === "MBUCONNECT") {
+        setStatus("Waiting for OK on the badge…");
+      }
+      try {
+        if (characteristic.writeValueWithResponse) {
+          await characteristic.writeValueWithResponse(encoder.encode(payload));
+        } else {
+          await characteristic.writeValue(encoder.encode(payload));
+        }
+      } catch (err) {
+        setStatus(err.message || String(err), "err");
+        log("Write failed", err.message || String(err));
+      }
+    }
+
+    connectBtn.addEventListener("click", connect);
+    disconnectBtn.addEventListener("click", disconnect);
+    actionBtns.forEach((btn) => {
+      btn.addEventListener("click", () => send(btn.dataset.action));
+    });
+  </script>
+</body>
+</html>
