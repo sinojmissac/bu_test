@@ -70,6 +70,25 @@
       font-size: 12px;
     }
     .hint { color: var(--muted); font-size: 0.8rem; margin-top: 12px; }
+    h2 { font-size: 0.95rem; margin: 16px 0 8px; }
+    #scan-list {
+      list-style: none;
+      margin: 0 0 12px;
+      padding: 0;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      min-height: 52px;
+    }
+    #scan-list li {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 0.9rem;
+    }
+    #scan-list li:last-child { border-bottom: 0; }
+    #scan-list .empty { color: var(--muted); }
+    #scan-list .meta { color: var(--muted); font-size: 0.8rem; }
+    #scan-list .badge-hit { border-left: 3px solid var(--ok); }
   </style>
 </head>
 <body>
@@ -77,9 +96,12 @@
   <div class="sub">Scan → connect → ping → MBU connect (accept on badge) → pull data</div>
   <div id="status" class="status">Disconnected. Chrome on Android or desktop; iOS Safari has no Web Bluetooth.</div>
   <div class="row">
+    <button id="scan">Scan 5s</button>
     <button id="connect">Connect to badge</button>
     <button id="disconnect" class="ghost" disabled>Disconnect</button>
   </div>
+  <h2>Nearby devices</h2>
+  <ul id="scan-list"><li class="empty">Tap Scan 5s to list BLE advertisers (Bluetooth check).</li></ul>
   <div class="grid">
     <button data-action="PING" disabled>Ping</button>
     <button data-action="MBUCONNECT" disabled>MBU connect</button>
@@ -94,8 +116,10 @@
   <pre id="log">Ready.</pre>
   <p class="hint">
     Badge needs <code>SmartphoneBluetoothPairing=true</code> and advertising.
-    After MBU connect, tap OK on the badge. Web Bluetooth needs HTTPS or localhost
-    (on a phone, copy this file to a host with HTTPS, or use Chrome on a PC with Bluetooth).
+    After MBU connect, tap OK on the badge. Web Bluetooth needs HTTPS or localhost.
+    Scan 5s uses the BLE advertisement scan API. Chrome may need
+    <code>chrome://flags/#enable-experimental-web-platform-features</code>.
+    Bluefy may only offer a device picker instead of a live list.
   </p>
 
   <script>
@@ -111,7 +135,12 @@
     const logEl = document.getElementById("log");
     const connectBtn = document.getElementById("connect");
     const disconnectBtn = document.getElementById("disconnect");
+    const scanBtn = document.getElementById("scan");
+    const scanList = document.getElementById("scan-list");
     const actionBtns = document.querySelectorAll("button[data-action]");
+    let scanHandle = null;
+    let scanTimer = null;
+    const foundDevices = new Map();
 
     function setStatus(text, kind) {
       statusEl.textContent = text;
@@ -210,8 +239,128 @@
       }
     }
 
+    function deviceKey(event) {
+      return event.device && event.device.id ? event.device.id : (event.device && event.device.name) || String(Math.random());
+    }
+
+    function isLikelyBadge(event) {
+      const name = (event.device && event.device.name) || "";
+      const uuids = event.uuids || [];
+      return name.indexOf("V5000") >= 0 || uuids.indexOf(SERVICE) >= 0;
+    }
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+
+    function renderScanList() {
+      const rows = Array.from(foundDevices.values()).sort((a, b) => (b.rssi || -999) - (a.rssi || -999));
+      if (!rows.length) {
+        scanList.innerHTML = "<li class=\"empty\">No advertisements yet…</li>";
+        return;
+      }
+      scanList.innerHTML = rows.map((d) => {
+        const title = esc(d.name || "(unnamed)");
+        const rssi = (d.rssi === undefined || d.rssi === null) ? "n/a" : d.rssi + " dBm";
+        const extra = (d.uuids && d.uuids.length) ? esc(d.uuids.join(", ")) : "";
+        const hit = d.badge ? " badge-hit" : "";
+        return "<li class=\"" + hit + "\"><div><strong>" + title + "</strong></div>" +
+          "<div class=\"meta\">id " + esc(d.id) + " · RSSI " + rssi +
+          (d.badge ? " · V5000 service" : "") +
+          (extra ? "<br>" + extra : "") + "</div></li>";
+      }).join("");
+    }
+
+    function onAdvertisement(event) {
+      const id = deviceKey(event);
+      foundDevices.set(id, {
+        id: id,
+        name: (event.device && event.device.name) || "",
+        rssi: event.rssi,
+        uuids: event.uuids || [],
+        badge: isLikelyBadge(event)
+      });
+      renderScanList();
+    }
+
+    function stopScan() {
+      if (scanTimer) {
+        clearTimeout(scanTimer);
+        scanTimer = null;
+      }
+      try {
+        if (scanHandle && scanHandle.stop) scanHandle.stop();
+      } catch (_) {}
+      scanHandle = null;
+      navigator.bluetooth && navigator.bluetooth.removeEventListener("advertisementreceived", onAdvertisement);
+      scanBtn.disabled = false;
+    }
+
+    async function scanFiveSeconds() {
+      if (!navigator.bluetooth) {
+        setStatus("Web Bluetooth not available in this browser.", "err");
+        return;
+      }
+      foundDevices.clear();
+      renderScanList();
+      scanBtn.disabled = true;
+
+      if (typeof navigator.bluetooth.requestLEScan !== "function") {
+        setStatus("Live scan not supported here. Opening device picker as a Bluetooth check…");
+        try {
+          const picked = await navigator.bluetooth.requestDevice({
+            acceptAllDevices: true
+          });
+          foundDevices.set(picked.id || picked.name || "picked", {
+            id: picked.id || "",
+            name: picked.name || "(unnamed)",
+            rssi: null,
+            uuids: [],
+            badge: (picked.name || "").indexOf("V5000") >= 0
+          });
+          renderScanList();
+          setStatus("Bluetooth works. Picker listed devices; you selected one.", "ok");
+          log("Scan fallback", (picked.name || "") + " " + (picked.id || ""));
+        } catch (err) {
+          scanList.innerHTML = "<li class=\"empty\">Scan cancelled or Bluetooth failed.</li>";
+          setStatus(err.message || String(err), "err");
+          log("Scan failed", err.message || String(err));
+        }
+        scanBtn.disabled = false;
+        return;
+      }
+
+      try {
+        setStatus("Scanning 5 seconds…");
+        navigator.bluetooth.addEventListener("advertisementreceived", onAdvertisement);
+        scanHandle = await navigator.bluetooth.requestLEScan({
+          acceptAllAdvertisements: true,
+          keepRepeatedDevices: true
+        });
+        scanTimer = setTimeout(() => {
+          const n = foundDevices.size;
+          stopScan();
+          if (n === 0) {
+            scanList.innerHTML = "<li class=\"empty\">Scan finished. No BLE advertisers heard.</li>";
+            setStatus("Scan finished: 0 devices. Bluetooth may be off, or the browser blocked LE scan.", "err");
+          } else {
+            setStatus("Scan finished: " + n + " device(s).", "ok");
+          }
+          log("Scan finished", n + " device(s)");
+        }, 5000);
+      } catch (err) {
+        stopScan();
+        setStatus(err.message || String(err), "err");
+        log("Scan failed", err.message || String(err));
+        scanList.innerHTML = "<li class=\"empty\">LE scan failed. Try the device picker via Connect, or enable experimental Web Bluetooth scanning.</li>";
+      }
+    }
+
     connectBtn.addEventListener("click", connect);
     disconnectBtn.addEventListener("click", disconnect);
+    scanBtn.addEventListener("click", scanFiveSeconds);
     actionBtns.forEach((btn) => {
       btn.addEventListener("click", () => send(btn.dataset.action));
     });
