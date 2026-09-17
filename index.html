@@ -113,11 +113,11 @@
 </head>
 <body>
   <h1>V5000 MBU Test</h1>
-  <div class="sub">Whitelist → close-range check → connect → authenticate → provision hotspot</div>
+  <div class="sub">Whitelist → connect → authenticate → provision hotspot (needs close-range proof)</div>
   <div id="status" class="status">Disconnected. Chrome on Android or desktop; iOS Safari has no Web Bluetooth.</div>
   <div class="row">
     <button id="scan">Scan 5s</button>
-    <button id="connect" disabled>Connect eligible badge</button>
+    <button id="connect" disabled>Connect whitelisted badge</button>
     <button id="disconnect" class="ghost" disabled>Disconnect</button>
   </div>
   <fieldset>
@@ -125,11 +125,10 @@
     <label class="file">Whitelisted V5000 IDs (comma separated, colons optional)
       <input id="whitelist" type="text" autocomplete="off" placeholder="001122AABBCC, 00:11:22:AA:BB:CD" />
     </label>
-    <label><input id="test-mode" type="checkbox" /> Test mode: bypass whitelist and proximity, pick the badge from the browser chooser</label>
-    <div class="auth-status">Test mode is for bench bring-up only. Leave it off for any security testing.</div>
+    <div class="auth-status">Connect unlocks as soon as a whitelisted ID appears in the scan. Hotspot provisioning additionally requires the sustained close-range check.</div>
   </fieldset>
   <h2>Nearby devices</h2>
-  <ul id="scan-list"><li class="empty">Tap Scan 5s. A device must be whitelisted and remain at least -60 dBm for 2 seconds.</li></ul>
+  <ul id="scan-list"><li class="empty">Tap Scan 5s. A whitelisted device becomes connectable as soon as it is seen.</li></ul>
   <fieldset>
     <legend>Mobile hotspot</legend>
     <label class="file">SSID
@@ -165,7 +164,9 @@
     Web Bluetooth needs HTTPS or localhost. Scan 5s uses the experimental BLE
     advertisement scan API. Chrome may need
     <code>chrome://flags/#enable-experimental-web-platform-features</code>.
-    Browsers without advertisement RSSI/manufacturer data fail closed.
+    Browsers without advertisement RSSI/manufacturer data can still connect
+    through the chooser filtered to the whitelisted ID, but cannot obtain the
+    close-range proof, so hotspot provisioning stays blocked there.
   </p>
 
   <!-- Forge supplies X.509 parsing/validation for this test harness. Production
@@ -200,6 +201,9 @@
     let eligibleDevice = null;
     let eligibleDeviceId = "";
     let eligibleAt = 0;
+    /* Sustained close-range proof, captured while scanning and gating provisioning. */
+    let eligibleProximate = false;
+    let scanUnsupported = false;
 
     const statusEl = document.getElementById("status");
     const logEl = document.getElementById("log");
@@ -217,7 +221,6 @@
     const hotspotPasswordInput = document.getElementById("hotspot-password");
     const provisionBtn = document.getElementById("provision");
     const whitelistInput = document.getElementById("whitelist");
-    const testModeInput = document.getElementById("test-mode");
     const actionBtns = document.querySelectorAll("button[data-action]");
     let scanHandle = null;
     let scanTimer = null;
@@ -250,7 +253,7 @@
     }
 
     function setConnected(on) {
-      connectBtn.disabled = on || (!eligibleDevice && !testModeInput.checked);
+      connectBtn.disabled = on || (!eligibleDevice && !scanUnsupported);
       disconnectBtn.disabled = !on;
       authBtn.disabled = !on;
       provisionBtn.disabled = !on || !auth.authenticated;
@@ -301,16 +304,8 @@
         setStatus("Web Bluetooth not available in this browser.", "err");
         return;
       }
-      const testMode = testModeInput.checked;
-      if (!eligibleDevice && !testMode) {
-        setStatus("No device has passed whitelist and proximity checks.", "err");
-        return;
-      }
-      if (eligibleDevice && Date.now() - eligibleAt > 5000 && !testMode) {
-        eligibleDevice = null;
-        eligibleDeviceId = "";
-        connectBtn.disabled = true;
-        setStatus("Proximity proof expired. Scan again near the badge.", "err");
+      if (!eligibleDevice && !scanUnsupported) {
+        setStatus("No whitelisted device found. Scan again near the badge.", "err");
         return;
       }
       try {
@@ -318,15 +313,24 @@
           device = eligibleDevice;
         } else {
           /*
-           * The chooser only lists badges whose advertisement carries the
-           * companion service UUID, which the badge emits solely when
-           * SmartphoneBluetoothPairing is enabled.
+           * Without advertisement scanning the whitelist can only be enforced
+           * by the chooser's manufacturer-data filter.
            */
-          setStatus("Test mode: pick the badge in the browser chooser…");
-          device = await navigator.bluetooth.requestDevice({
-            filters: [{ services: [SERVICE] }, { namePrefix: "V5000" }],
-            optionalServices: [SERVICE]
-          });
+          setStatus("Advertisement scanning unavailable; pick the badge in the browser chooser…");
+          try {
+            device = await navigator.bluetooth.requestDevice({
+              filters: chooserFilters(),
+              optionalServices: [SERVICE]
+            });
+          } catch (err) {
+            if (err.name !== "TypeError") throw err;
+            /* Older engines reject manufacturerData filters outright. */
+            log("Chooser", "Manufacturer data filter unsupported; falling back to service filter");
+            device = await navigator.bluetooth.requestDevice({
+              filters: [{ services: [SERVICE] }],
+              optionalServices: [SERVICE]
+            });
+          }
         }
         device.addEventListener("gattserverdisconnected", onDisconnected);
         setStatus("Connecting GATT…");
@@ -588,6 +592,10 @@
         setStatus("Authenticate the badge and app first.", "err");
         return;
       }
+      if (!eligibleProximate) {
+        setStatus("Close-range proof missing. Scan next to the badge before provisioning.", "err");
+        return;
+      }
 
       const ssid = hotspotSSIDInput.value;
       const password = hotspotPasswordInput.value;
@@ -713,6 +721,30 @@
       return !!id && whitelistEntries().indexOf(id) >= 0;
     }
 
+    /*
+     * Web Bluetooth exposes no MAC address and has no MAC filter. The badge
+     * embeds its Wi-Fi MAC in the manufacturer record, so matching that record
+     * is the closest equivalent. The comparison happens inside the browser's
+     * Bluetooth stack, so it still narrows the chooser in browsers that refuse
+     * to hand advertisement data to script.
+     */
+    function chooserFilters() {
+      const filters = whitelistEntries()
+        .filter((id) => /^[0-9A-F]{12}$/.test(id))
+        .map((id) => ({
+          manufacturerData: [{
+            companyIdentifier: VOCERA_COMPANY_ID,
+            dataPrefix: new Uint8Array(
+              [0x56, 0x35, 0x30, 0x30, 0x30].concat(
+                id.match(/.{2}/g).map((b) => parseInt(b, 16))
+              )
+            )
+          }]
+        }));
+      filters.push({ services: [SERVICE] });
+      return filters;
+    }
+
     function esc(s) {
       return String(s).replace(/[&<>"']/g, (c) => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -730,17 +762,17 @@
         const rssi = (d.medianRssi === undefined || d.medianRssi === null) ? "n/a" : d.medianRssi + " dBm median";
         const extra = (d.uuids && d.uuids.length) ? esc(d.uuids.join(", ")) : "";
         const hit = d.eligible ? " badge-hit" : "";
-        const blockers = [];
-        if (!d.manufacturerId) blockers.push("no V5000 manufacturer data");
-        else if (!d.whitelisted) blockers.push("not whitelisted");
-        if (d.manufacturerId && !d.proximate) blockers.push("not close long enough");
+        let note = "";
+        if (!d.manufacturerId) note = "blocked: no V5000 manufacturer data";
+        else if (!d.whitelisted) note = "blocked: not whitelisted";
+        else if (!d.proximate) note = "connectable; close-range proof for provisioning not met yet";
         return "<li class=\"" + hit + "\"><div><strong>" + title + "</strong></div>" +
           "<div class=\"meta\">id " + esc(d.id) + " · RSSI " + rssi +
           (d.manufacturerId ? "<br>V5000 ID " + esc(displayDeviceId(d.manufacturerId)) : "") +
           (d.whitelisted ? " · whitelisted" : "") +
           (d.closeSamples ? " · close samples " + d.closeSamples : "") +
-          (d.eligible ? " · ELIGIBLE" : "") +
-          (blockers.length ? "<br>blocked: " + esc(blockers.join(", ")) : "") +
+          (d.eligible ? " · CONNECTABLE" : "") +
+          (note ? "<br>" + esc(note) : "") +
           (extra ? "<br>" + extra : "") + "</div></li>";
       }).join("");
     }
@@ -765,7 +797,11 @@
       const proximate = samples.length >= MIN_CLOSE_SAMPLES &&
         sampleSpan >= PROXIMITY_HOLD_MS &&
         goodSamples / samples.length >= MIN_GOOD_RSSI_FRACTION;
-      const eligible = whitelisted && proximate;
+      /*
+       * Seeing a whitelisted ID is enough to connect. The sustained close-range
+       * proof is tracked separately because it only gates provisioning.
+       */
+      const eligible = whitelisted;
 
       const record = {
         id: id,
@@ -788,17 +824,13 @@
         eligibleDevice = event.device;
         eligibleDeviceId = manufacturerId;
         eligibleAt = now;
-        connectBtn.disabled = false;
+        eligibleProximate = eligibleProximate || proximate;
+        connectBtn.disabled = !!characteristic;
         setStatus(
-          "Eligibility passed for " + displayDeviceId(manufacturerId) +
-          ": whitelisted and close for 2 seconds.",
+          "Whitelisted badge found: " + displayDeviceId(manufacturerId) +
+          (eligibleProximate ? ". Close-range check passed." : ". Close-range check still pending."),
           "ok"
         );
-      } else if (eligibleDeviceId && eligibleDeviceId === manufacturerId && !proximate) {
-        eligibleDevice = null;
-        eligibleDeviceId = "";
-        eligibleAt = 0;
-        connectBtn.disabled = true;
       }
       renderScanList();
     }
@@ -825,16 +857,24 @@
       eligibleDevice = null;
       eligibleDeviceId = "";
       eligibleAt = 0;
+      eligibleProximate = false;
       connectBtn.disabled = true;
       renderScanList();
       scanBtn.disabled = true;
 
       if (typeof navigator.bluetooth.requestLEScan !== "function") {
-        scanList.innerHTML = "<li class=\"empty\">This browser cannot expose manufacturer data and RSSI. Eligibility checks cannot be completed. Enable test mode to connect through the browser chooser instead.</li>";
-        setStatus("Advertisement scanning is unsupported; provisioning fails closed.", "err");
+        /*
+         * No advertisement access, so the whitelist can only be enforced by the
+         * chooser filter and the close-range proof is unobtainable.
+         */
+        scanUnsupported = true;
+        scanList.innerHTML = "<li class=\"empty\">This browser cannot expose manufacturer data and RSSI. Use Connect to pick the badge through the chooser, filtered to the whitelisted ID.</li>";
+        setStatus("Advertisement scanning unsupported. Connect uses the filtered chooser; provisioning stays blocked.", "err");
         scanBtn.disabled = false;
+        connectBtn.disabled = !!characteristic;
         return;
       }
+      scanUnsupported = false;
 
       try {
         setStatus("Scanning 5 seconds…");
@@ -843,25 +883,20 @@
          * The badge splits its data: the companion service UUID rides in the
          * advertisement, the V5000 manufacturer record only in the scan
          * response. Match either one rather than requiring both in a single
-         * filter. Test mode listens to everything so an unknown badge's ID can
-         * be read off the list and pasted into the whitelist.
+         * filter.
          */
-        scanHandle = await navigator.bluetooth.requestLEScan(
-          testModeInput.checked
-            ? { acceptAllAdvertisements: true, keepRepeatedDevices: true }
-            : {
-                filters: [
-                  { services: [SERVICE] },
-                  {
-                    manufacturerData: [{
-                      companyIdentifier: VOCERA_COMPANY_ID,
-                      dataPrefix: new Uint8Array([0x56, 0x35, 0x30, 0x30, 0x30]) // "V5000"
-                    }]
-                  }
-                ],
-                keepRepeatedDevices: true
-              }
-        );
+        scanHandle = await navigator.bluetooth.requestLEScan({
+          filters: [
+            { services: [SERVICE] },
+            {
+              manufacturerData: [{
+                companyIdentifier: VOCERA_COMPANY_ID,
+                dataPrefix: new Uint8Array([0x56, 0x35, 0x30, 0x30, 0x30]) // "V5000"
+              }]
+            }
+          ],
+          keepRepeatedDevices: true
+        });
         scanTimer = setTimeout(() => {
           const n = foundDevices.size;
           stopScan();
@@ -869,9 +904,13 @@
             scanList.innerHTML = "<li class=\"empty\">Scan finished. No BLE advertisers heard.</li>";
             setStatus("Scan finished: 0 devices. Bluetooth may be off, or the browser blocked LE scan.", "err");
           } else if (!eligibleDevice) {
-            setStatus("Scan finished: no badge passed whitelist and sustained proximity.", "err");
+            setStatus("Scan finished: no whitelisted badge seen.", "err");
           } else {
-            setStatus("Eligible badge ready: " + displayDeviceId(eligibleDeviceId), "ok");
+            setStatus(
+              "Whitelisted badge ready: " + displayDeviceId(eligibleDeviceId) +
+              (eligibleProximate ? ". Close-range check passed." : ". Close-range check not met; provisioning stays blocked."),
+              "ok"
+            );
           }
           log("Scan finished", n + " device(s)");
         }, 5000);
@@ -892,15 +931,6 @@
     whitelistInput.addEventListener("change", () => {
       localStorage.setItem("mbu.whitelist", whitelistInput.value);
     });
-    testModeInput.addEventListener("change", () => {
-      setConnected(!!characteristic);
-      if (testModeInput.checked) {
-        setStatus("Test mode on: eligibility checks bypassed, provisioning still needs authentication.", "err");
-      } else {
-        setStatus("Test mode off. Scan to re-establish eligibility.");
-      }
-    });
-
     connectBtn.addEventListener("click", connect);
     disconnectBtn.addEventListener("click", disconnect);
     scanBtn.addEventListener("click", scanFiveSeconds);
