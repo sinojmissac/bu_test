@@ -89,47 +89,117 @@
     #scan-list .empty { color: var(--muted); }
     #scan-list .meta { color: var(--muted); font-size: 0.8rem; }
     #scan-list .badge-hit { border-left: 3px solid var(--ok); }
+    fieldset {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      margin: 0 0 12px;
+      padding: 10px 12px 12px;
+    }
+    legend { color: var(--muted); padding: 0 5px; }
+    label.file { display: block; margin: 8px 0; }
+    input[type="file"] { display: block; margin-top: 4px; width: 100%; }
+    input[type="text"], input[type="password"] {
+      display: block;
+      width: 100%;
+      margin-top: 4px;
+      padding: 9px;
+      color: var(--ink);
+      background: #0a0e12;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+    }
+    .auth-status { color: var(--muted); font-size: 0.85rem; margin: 8px 0; }
   </style>
 </head>
 <body>
   <h1>V5000 MBU Test</h1>
-  <div class="sub">Scan → connect → ping → MBU connect (accept on badge) → pull data</div>
+  <div class="sub">Whitelist → close-range check → connect → authenticate → provision hotspot</div>
   <div id="status" class="status">Disconnected. Chrome on Android or desktop; iOS Safari has no Web Bluetooth.</div>
   <div class="row">
     <button id="scan">Scan 5s</button>
-    <button id="connect">Connect to badge</button>
+    <button id="connect" disabled>Connect eligible badge</button>
     <button id="disconnect" class="ghost" disabled>Disconnect</button>
   </div>
+  <fieldset>
+    <legend>Device eligibility</legend>
+    <label class="file">Whitelisted V5000 IDs (comma separated, colons optional)
+      <input id="whitelist" type="text" autocomplete="off" placeholder="001122AABBCC, 00:11:22:AA:BB:CD" />
+    </label>
+    <label><input id="test-mode" type="checkbox" /> Test mode: bypass whitelist and proximity, pick the badge from the browser chooser</label>
+    <div class="auth-status">Test mode is for bench bring-up only. Leave it off for any security testing.</div>
+  </fieldset>
   <h2>Nearby devices</h2>
-  <ul id="scan-list"><li class="empty">Tap Scan 5s to list BLE advertisers (Bluetooth check).</li></ul>
-  <div class="grid">
-    <button data-action="PING" disabled>Ping</button>
-    <button data-action="MBUCONNECT" disabled>MBU connect</button>
-    <button data-action="MBUBASICINFO" disabled>Basic info</button>
-    <button data-action="MBUIPINFO" disabled>IP info</button>
-    <button data-action="MBUSERVERINFO" disabled>Server info</button>
-    <button data-action="MBUWLANINFO1" disabled>WLAN 1</button>
-    <button data-action="MBUWLANINFO2" disabled>WLAN 2</button>
-    <button data-action="MBUMULTICASTINFO" disabled>Multicast</button>
-    <button data-action="MBUDISCONNECT" disabled>MBU disconnect</button>
-  </div>
+  <ul id="scan-list"><li class="empty">Tap Scan 5s. A device must be whitelisted and remain at least -60 dBm for 2 seconds.</li></ul>
+  <fieldset>
+    <legend>Mobile hotspot</legend>
+    <label class="file">SSID
+      <input id="hotspot-ssid" type="text" maxlength="32" autocomplete="off" />
+    </label>
+    <label class="file">Password
+      <input id="hotspot-password" type="password" minlength="8" maxlength="63" autocomplete="new-password" />
+    </label>
+    <button id="provision" disabled>Send and provision hotspot</button>
+  </fieldset>
+  <fieldset>
+    <legend>Certificate authentication</legend>
+    <label class="file">Client certificate (PEM)
+      <input id="client-cert" type="file" accept=".pem,.crt,.cer" />
+    </label>
+    <label class="file">Client RSA private key (unencrypted PEM)
+      <input id="client-key" type="file" accept=".pem,.key" />
+    </label>
+    <label><input id="verify-badge" type="checkbox" /> Verify badge certificate against CA</label>
+    <label class="file">Trusted badge CA (PEM; required when verification is checked)
+      <input id="badge-ca" type="file" accept=".pem,.crt,.cer" />
+    </label>
+    <div id="auth-status" class="auth-status">Connect first, then authenticate.</div>
+    <button id="authenticate" disabled>Authenticate certificates</button>
+  </fieldset>
   <pre id="log">Ready.</pre>
   <p class="hint">
-    Badge needs <code>SmartphoneBluetoothPairing=true</code> and advertising.
-    After MBU connect, tap OK on the badge. Web Bluetooth needs HTTPS or localhost.
-    Scan 5s uses the BLE advertisement scan API. Chrome may need
+    The badge only advertises the companion service and starts its GATT server
+    when <code>SmartphoneBluetoothPairing=true</code>. With it false the badge
+    still shows up in a generic scan but cannot be connected.
+    Whitelisted IDs entered above are saved in this browser; the
+    <code>WHITELISTED_DEVICE_IDS</code> constant is only the default.
+    Web Bluetooth needs HTTPS or localhost. Scan 5s uses the experimental BLE
+    advertisement scan API. Chrome may need
     <code>chrome://flags/#enable-experimental-web-platform-features</code>.
-    Bluefy may only offer a device picker instead of a live list.
+    Browsers without advertisement RSSI/manufacturer data fail closed.
   </p>
 
+  <!-- Forge supplies X.509 parsing/validation for this test harness. Production
+       apps should vendor and pin their crypto dependency. -->
+  <script
+    src="https://cdn.jsdelivr.net/npm/node-forge@1.3.1/dist/forge.min.js"
+    integrity="sha384-xE6n3RBMZWgwAhyzoIMfY7HN3oDBa/+HBwFFNyxsdY8kseup7C4Blx1yDzprEESV"
+    crossorigin="anonymous"></script>
   <script>
     const SERVICE = "ef16b600-9c17-455c-819a-4ce618569300";
     const CHAR = "ef16b601-9c17-455c-819a-4ce618569300";
+    const VOCERA_COMPANY_ID = 0x0ade;
+    const RSSI_THRESHOLD_DBM = -60;
+    const PROXIMITY_WINDOW_MS = 2500;
+    const PROXIMITY_HOLD_MS = 2000;
+    const MIN_CLOSE_SAMPLES = 6;
+    const MIN_GOOD_RSSI_FRACTION = 0.75;
+
+    /*
+     * Uppercase MAC/device IDs from V5000 manufacturer data, without colons.
+     * Example: "001122AABBCC". An empty list intentionally rejects every badge.
+     */
+    const WHITELISTED_DEVICE_IDS = [
+      // "001122AABBCC"
+    ];
+
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
 
     let device = null;
     let characteristic = null;
+    let eligibleDevice = null;
+    let eligibleDeviceId = "";
+    let eligibleAt = 0;
 
     const statusEl = document.getElementById("status");
     const logEl = document.getElementById("log");
@@ -137,10 +207,33 @@
     const disconnectBtn = document.getElementById("disconnect");
     const scanBtn = document.getElementById("scan");
     const scanList = document.getElementById("scan-list");
+    const authBtn = document.getElementById("authenticate");
+    const authStatusEl = document.getElementById("auth-status");
+    const clientCertInput = document.getElementById("client-cert");
+    const clientKeyInput = document.getElementById("client-key");
+    const badgeCaInput = document.getElementById("badge-ca");
+    const verifyBadgeInput = document.getElementById("verify-badge");
+    const hotspotSSIDInput = document.getElementById("hotspot-ssid");
+    const hotspotPasswordInput = document.getElementById("hotspot-password");
+    const provisionBtn = document.getElementById("provision");
+    const whitelistInput = document.getElementById("whitelist");
+    const testModeInput = document.getElementById("test-mode");
     const actionBtns = document.querySelectorAll("button[data-action]");
     let scanHandle = null;
     let scanTimer = null;
     const foundDevices = new Map();
+    const auth = {
+      active: false,
+      authenticated: false,
+      sessionId: "",
+      clientNonce: "",
+      badgeNonce: "",
+      badgeCertLength: 0,
+      badgeCertBase64: "",
+      badgeCert: null,
+      clientCertBase64: "",
+      clientKeyPem: ""
+    };
 
     function setStatus(text, kind) {
       statusEl.textContent = text;
@@ -157,16 +250,24 @@
     }
 
     function setConnected(on) {
-      connectBtn.disabled = on;
+      connectBtn.disabled = on || (!eligibleDevice && !testModeInput.checked);
       disconnectBtn.disabled = !on;
+      authBtn.disabled = !on;
+      provisionBtn.disabled = !on || !auth.authenticated;
       actionBtns.forEach((b) => { b.disabled = !on; });
     }
 
-    function onNotify(event) {
+    async function onNotify(event) {
       const text = decoder.decode(event.target.value);
       log("Notify", text);
       try {
         const json = JSON.parse(text);
+        if ((json.action && json.action.indexOf("AUTH_") === 0) ||
+            json.action === "HOTSPOT_RESULT" ||
+            json.action === "HOTSPOT_STATUS") {
+          await handleAuthMessage(json);
+          return;
+        }
         if (json.action === "MBUCONNECT") {
           const status = (json.slots || []).find((s) => s.key === "status");
           if (status && status.value === "ok") {
@@ -175,7 +276,13 @@
             setStatus("MBU connect declined or failed.", "err");
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        if (auth.active) {
+          auth.active = false;
+          setAuthStatus(err.message || String(err), false);
+          log("Authentication failed", err.message || String(err));
+        }
+      }
     }
 
     function onDisconnected() {
@@ -184,6 +291,7 @@
       }
       characteristic = null;
       device = null;
+      resetAuth();
       setConnected(false);
       setStatus("Disconnected", "err");
     }
@@ -193,12 +301,33 @@
         setStatus("Web Bluetooth not available in this browser.", "err");
         return;
       }
+      const testMode = testModeInput.checked;
+      if (!eligibleDevice && !testMode) {
+        setStatus("No device has passed whitelist and proximity checks.", "err");
+        return;
+      }
+      if (eligibleDevice && Date.now() - eligibleAt > 5000 && !testMode) {
+        eligibleDevice = null;
+        eligibleDeviceId = "";
+        connectBtn.disabled = true;
+        setStatus("Proximity proof expired. Scan again near the badge.", "err");
+        return;
+      }
       try {
-        setStatus("Pick the V5000 in the chooser…");
-        device = await navigator.bluetooth.requestDevice({
-          filters: [{ services: [SERVICE] }],
-          optionalServices: [SERVICE]
-        });
+        if (eligibleDevice) {
+          device = eligibleDevice;
+        } else {
+          /*
+           * The chooser only lists badges whose advertisement carries the
+           * companion service UUID, which the badge emits solely when
+           * SmartphoneBluetoothPairing is enabled.
+           */
+          setStatus("Test mode: pick the badge in the browser chooser…");
+          device = await navigator.bluetooth.requestDevice({
+            filters: [{ services: [SERVICE] }, { namePrefix: "V5000" }],
+            optionalServices: [SERVICE]
+          });
+        }
         device.addEventListener("gattserverdisconnected", onDisconnected);
         setStatus("Connecting GATT…");
         const server = await device.gatt.connect();
@@ -227,6 +356,11 @@
       if (action === "MBUCONNECT") {
         setStatus("Waiting for OK on the badge…");
       }
+      await writeJson(payload);
+    }
+
+    async function writeJson(payload) {
+      if (!characteristic) throw new Error("Badge is not connected");
       try {
         if (characteristic.writeValueWithResponse) {
           await characteristic.writeValueWithResponse(encoder.encode(payload));
@@ -236,6 +370,307 @@
       } catch (err) {
         setStatus(err.message || String(err), "err");
         log("Write failed", err.message || String(err));
+        throw err;
+      }
+    }
+
+    function setAuthStatus(text, ok) {
+      authStatusEl.textContent = text;
+      authStatusEl.style.color = ok === true ? "var(--ok)" : ok === false ? "var(--err)" : "var(--muted)";
+    }
+
+    function resetAuth() {
+      auth.active = false;
+      auth.authenticated = false;
+      auth.sessionId = "";
+      auth.clientNonce = "";
+      auth.badgeNonce = "";
+      auth.badgeCertLength = 0;
+      auth.badgeCertBase64 = "";
+      auth.badgeCert = null;
+      auth.clientCertBase64 = "";
+      auth.clientKeyPem = "";
+      provisionBtn.disabled = true;
+      setAuthStatus("Connect first, then authenticate.");
+    }
+
+    function bytesToBase64(bytes) {
+      let binary = "";
+      bytes.forEach((b) => { binary += String.fromCharCode(b); });
+      return btoa(binary);
+    }
+
+    function randomBase64(length) {
+      const bytes = new Uint8Array(length);
+      crypto.getRandomValues(bytes);
+      return bytesToBase64(bytes);
+    }
+
+    function pemBody(pem, label) {
+      const begin = "-----BEGIN " + label + "-----";
+      const end = "-----END " + label + "-----";
+      const start = pem.indexOf(begin);
+      const finish = pem.indexOf(end);
+      if (start < 0 || finish < 0 || finish <= start) {
+        throw new Error("Expected PEM block: " + label);
+      }
+      return pem.slice(start + begin.length, finish).replace(/\s/g, "");
+    }
+
+    function certificateFromBase64(base64) {
+      const der = forge.util.decode64(base64);
+      return forge.pki.certificateFromAsn1(forge.asn1.fromDer(der));
+    }
+
+    function transcript() {
+      return "MBU-BLE-AUTH-V1\nsessionId=" + auth.sessionId +
+        "\nclientNonce=" + auth.clientNonce +
+        "\nbadgeNonce=" + auth.badgeNonce;
+    }
+
+    async function verifyBadgeCertificate() {
+      if (!verifyBadgeInput.checked) return;
+      const caFile = badgeCaInput.files[0];
+      if (!caFile) throw new Error("Select the trusted badge CA certificate");
+      const caPem = await caFile.text();
+      const store = forge.pki.createCaStore([caPem]);
+      forge.pki.verifyCertificateChain(store, [auth.badgeCert]);
+    }
+
+    function signTranscript() {
+      let key;
+      try {
+        key = forge.pki.privateKeyFromPem(auth.clientKeyPem);
+      } catch (_) {
+        throw new Error("Client key must be an unencrypted RSA PEM key");
+      }
+      const md = forge.md.sha256.create();
+      md.update(transcript(), "utf8");
+      return forge.util.encode64(key.sign(md));
+    }
+
+    function verifyBadgeProof(signatureBase64) {
+      const md = forge.md.sha256.create();
+      md.update(transcript(), "utf8");
+      const signature = forge.util.decode64(signatureBase64);
+      if (!auth.badgeCert.publicKey.verify(md.digest().bytes(), signature)) {
+        throw new Error("Badge signature is invalid");
+      }
+    }
+
+    async function requestBadgeCert(offset) {
+      await writeJson(JSON.stringify({
+        action: "AUTH_BADGE_CERT",
+        offset: offset
+      }));
+    }
+
+    async function sendClientCertChunk(offset) {
+      const chunk = auth.clientCertBase64.slice(offset, offset + 256);
+      await writeJson(JSON.stringify({
+        action: "AUTH_CLIENT_CERT",
+        sessionId: auth.sessionId,
+        offset: offset,
+        total: auth.clientCertBase64.length,
+        data: chunk
+      }));
+    }
+
+    async function handleAuthMessage(message) {
+      if (message.action === "AUTH_ERROR") {
+        const duringHandshake = auth.active;
+        auth.active = false;
+        if (duringHandshake) {
+          auth.authenticated = false;
+          provisionBtn.disabled = true;
+        }
+        setAuthStatus(message.error || "Authentication failed", false);
+        throw new Error(message.error || "Authentication failed");
+      }
+
+      if (message.action === "HOTSPOT_RESULT") {
+        if (message.sessionId !== auth.sessionId || message.status !== "accepted") {
+          throw new Error("Badge rejected hotspot provisioning");
+        }
+        hotspotPasswordInput.value = "";
+        setStatus("Hotspot profile accepted. Badge is restarting Wi-Fi and connecting.", "ok");
+        log("Provisioning", "Hotspot credentials accepted by badge");
+        return;
+      }
+
+      if (message.action === "HOTSPOT_STATUS") {
+        if (message.sessionId !== auth.sessionId) return;
+        if (message.status === "connected") {
+          setStatus("Badge connected to the mobile hotspot.", "ok");
+        } else {
+          setStatus("Badge hotspot connection failed: " + (message.reason || "unknown error"), "err");
+        }
+        log("Hotspot status", message.status + (message.reason ? ": " + message.reason : ""));
+        return;
+      }
+
+      if (!auth.active) return;
+
+      if (message.action === "AUTH_CHALLENGE") {
+        if (message.protocol !== "MBU-BLE-AUTH-V1" ||
+            !message.sessionId || !message.badgeNonce ||
+            message.certificateLength <= 0 || message.certificateLength > 6144) {
+          throw new Error("Invalid badge authentication challenge");
+        }
+        auth.sessionId = message.sessionId;
+        auth.badgeNonce = message.badgeNonce;
+        auth.badgeCertLength = message.certificateLength;
+        auth.badgeCertBase64 = "";
+        setAuthStatus("Receiving badge certificate…");
+        await requestBadgeCert(0);
+        return;
+      }
+
+      if (message.action === "AUTH_BADGE_CERT") {
+        if (message.sessionId !== auth.sessionId ||
+            message.offset !== auth.badgeCertBase64.length ||
+            message.total !== auth.badgeCertLength ||
+            typeof message.data !== "string") {
+          throw new Error("Invalid badge certificate chunk");
+        }
+        auth.badgeCertBase64 += message.data;
+        if (auth.badgeCertBase64.length < auth.badgeCertLength) {
+          await requestBadgeCert(auth.badgeCertBase64.length);
+          return;
+        }
+
+        auth.badgeCert = certificateFromBase64(auth.badgeCertBase64);
+        await verifyBadgeCertificate();
+        setAuthStatus("Badge proof key loaded. Sending client certificate…");
+        await sendClientCertChunk(0);
+        return;
+      }
+
+      if (message.action === "AUTH_CLIENT_CERT") {
+        if (message.sessionId !== auth.sessionId ||
+            message.nextOffset < 0 ||
+            message.nextOffset > auth.clientCertBase64.length) {
+          throw new Error("Invalid client certificate acknowledgement");
+        }
+        if (message.nextOffset < auth.clientCertBase64.length) {
+          await sendClientCertChunk(message.nextOffset);
+          return;
+        }
+
+        setAuthStatus("Proving possession of client private key…");
+        await writeJson(JSON.stringify({
+          action: "AUTH_PROVE",
+          sessionId: auth.sessionId,
+          signature: signTranscript()
+        }));
+        return;
+      }
+
+      if (message.action === "AUTH_RESULT") {
+        if (message.sessionId !== auth.sessionId || message.status !== "ok" || !message.signature) {
+          throw new Error("Badge rejected authentication");
+        }
+        verifyBadgeProof(message.signature);
+        auth.active = false;
+        auth.authenticated = true;
+        provisionBtn.disabled = false;
+        setAuthStatus(
+          "Mutual proof complete" +
+          (verifyBadgeInput.checked ? "; badge certificate trusted." : "; badge CA verification bypassed."),
+          true
+        );
+        setStatus("Certificate authentication complete. You can MBU connect.", "ok");
+      }
+    }
+
+    async function provisionHotspot() {
+      if (!auth.authenticated || !auth.badgeCert) {
+        setStatus("Authenticate the badge and app first.", "err");
+        return;
+      }
+
+      const ssid = hotspotSSIDInput.value;
+      const password = hotspotPasswordInput.value;
+      if (!ssid || encoder.encode(ssid).length > 32) {
+        setStatus("SSID must be 1–32 bytes.", "err");
+        return;
+      }
+      const passwordBytes = encoder.encode(password).length;
+      if (passwordBytes < 8 || passwordBytes > 63 || !/^[\x20-\x7e]+$/.test(password)) {
+        setStatus("Hotspot password must be 8–63 printable ASCII bytes.", "err");
+        return;
+      }
+
+      try {
+        const plaintext = JSON.stringify({ ssid: ssid, password: password });
+        const publicKey = auth.badgeCert.publicKey;
+        if (!publicKey || typeof publicKey.encrypt !== "function") {
+          throw new Error("Hotspot provisioning requires an RSA badge certificate");
+        }
+        const ciphertext = publicKey.encrypt(plaintext, "RSA-OAEP", {
+          md: forge.md.sha256.create(),
+          mgf1: { md: forge.md.sha256.create() }
+        });
+        const payload = JSON.stringify({
+          action: "HOTSPOT_PROVISION",
+          sessionId: auth.sessionId,
+          ciphertext: forge.util.encode64(ciphertext)
+        });
+        if (encoder.encode(payload).length >= 495) {
+          throw new Error("Encrypted provisioning message exceeds the BLE transport limit");
+        }
+        setStatus("Sending encrypted hotspot credentials…");
+        await writeJson(payload);
+      } catch (err) {
+        setStatus(err.message || String(err), "err");
+        log("Provisioning failed", err.message || String(err));
+      }
+    }
+
+    async function authenticateCertificates() {
+      if (!window.forge) {
+        setAuthStatus("X.509 library failed to load. Check internet access to jsDelivr.", false);
+        return;
+      }
+      const certFile = clientCertInput.files[0];
+      const keyFile = clientKeyInput.files[0];
+      if (!certFile || !keyFile) {
+        setAuthStatus("Select a client certificate and private key.", false);
+        return;
+      }
+
+      try {
+        const certPem = await certFile.text();
+        auth.clientKeyPem = await keyFile.text();
+        auth.clientCertBase64 = pemBody(certPem, "CERTIFICATE");
+        if (auth.clientCertBase64.length > 6144) {
+          throw new Error("Client certificate exceeds the 6144-byte protocol limit");
+        }
+        /* Parse and match both files before sending anything, to fail early. */
+        const clientCert = certificateFromBase64(auth.clientCertBase64);
+        const clientKey = forge.pki.privateKeyFromPem(auth.clientKeyPem);
+        const testMd = forge.md.sha256.create();
+        testMd.update("MBU client key check", "utf8");
+        const testSignature = clientKey.sign(testMd);
+        const verifyMd = forge.md.sha256.create();
+        verifyMd.update("MBU client key check", "utf8");
+        if (!clientCert.publicKey.verify(verifyMd.digest().bytes(), testSignature)) {
+          throw new Error("Client certificate and private key do not match");
+        }
+
+        auth.active = true;
+        auth.authenticated = false;
+        provisionBtn.disabled = true;
+        auth.clientNonce = randomBase64(32);
+        setAuthStatus("Starting certificate authentication…");
+        await writeJson(JSON.stringify({
+          action: "AUTH_BEGIN",
+          clientNonce: auth.clientNonce
+        }));
+      } catch (err) {
+        auth.active = false;
+        setAuthStatus(err.message || String(err), false);
+        log("Authentication failed", err.message || String(err));
       }
     }
 
@@ -246,7 +681,36 @@
     function isLikelyBadge(event) {
       const name = (event.device && event.device.name) || "";
       const uuids = event.uuids || [];
-      return name.indexOf("V5000") >= 0 || uuids.indexOf(SERVICE) >= 0;
+      return name.indexOf("V5000") >= 0 || uuids.indexOf(SERVICE) >= 0 ||
+        !!readManufacturerDeviceId(event);
+    }
+
+    function readManufacturerDeviceId(event) {
+      if (!event.manufacturerData || typeof event.manufacturerData.get !== "function") return "";
+      const view = event.manufacturerData.get(VOCERA_COMPANY_ID);
+      if (!view || view.byteLength < 11) return "";
+      const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      const prefix = String.fromCharCode.apply(null, bytes.slice(0, 5));
+      if (prefix !== "V5000") return "";
+      return Array.from(bytes.slice(5, 11))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("")
+        .toUpperCase();
+    }
+
+    function displayDeviceId(id) {
+      return id ? id.match(/.{1,2}/g).join(":") : "unavailable";
+    }
+
+    function whitelistEntries() {
+      return (whitelistInput.value || "")
+        .split(",")
+        .map((item) => item.replace(/[^0-9a-f]/gi, "").toUpperCase())
+        .filter((item) => item.length > 0);
+    }
+
+    function isWhitelisted(id) {
+      return !!id && whitelistEntries().indexOf(id) >= 0;
     }
 
     function esc(s) {
@@ -263,25 +727,79 @@
       }
       scanList.innerHTML = rows.map((d) => {
         const title = esc(d.name || "(unnamed)");
-        const rssi = (d.rssi === undefined || d.rssi === null) ? "n/a" : d.rssi + " dBm";
+        const rssi = (d.medianRssi === undefined || d.medianRssi === null) ? "n/a" : d.medianRssi + " dBm median";
         const extra = (d.uuids && d.uuids.length) ? esc(d.uuids.join(", ")) : "";
-        const hit = d.badge ? " badge-hit" : "";
+        const hit = d.eligible ? " badge-hit" : "";
+        const blockers = [];
+        if (!d.manufacturerId) blockers.push("no V5000 manufacturer data");
+        else if (!d.whitelisted) blockers.push("not whitelisted");
+        if (d.manufacturerId && !d.proximate) blockers.push("not close long enough");
         return "<li class=\"" + hit + "\"><div><strong>" + title + "</strong></div>" +
           "<div class=\"meta\">id " + esc(d.id) + " · RSSI " + rssi +
-          (d.badge ? " · V5000 service" : "") +
+          (d.manufacturerId ? "<br>V5000 ID " + esc(displayDeviceId(d.manufacturerId)) : "") +
+          (d.whitelisted ? " · whitelisted" : "") +
+          (d.closeSamples ? " · close samples " + d.closeSamples : "") +
+          (d.eligible ? " · ELIGIBLE" : "") +
+          (blockers.length ? "<br>blocked: " + esc(blockers.join(", ")) : "") +
           (extra ? "<br>" + extra : "") + "</div></li>";
       }).join("");
     }
 
     function onAdvertisement(event) {
       const id = deviceKey(event);
-      foundDevices.set(id, {
+      const now = Date.now();
+      const previous = foundDevices.get(id) || {};
+      const manufacturerId = readManufacturerDeviceId(event) || previous.manufacturerId || "";
+      const whitelisted = isWhitelisted(manufacturerId);
+      const samples = (previous.samples || [])
+        .filter((sample) => now - sample.ts <= PROXIMITY_WINDOW_MS);
+      if (typeof event.rssi === "number") {
+        samples.push({ rssi: event.rssi, ts: now });
+      }
+      const sortedRssi = samples.map((sample) => sample.rssi).sort((a, b) => a - b);
+      const medianRssi = sortedRssi.length
+        ? sortedRssi[Math.floor(sortedRssi.length / 2)]
+        : null;
+      const goodSamples = samples.filter((sample) => sample.rssi >= RSSI_THRESHOLD_DBM).length;
+      const sampleSpan = samples.length > 1 ? now - samples[0].ts : 0;
+      const proximate = samples.length >= MIN_CLOSE_SAMPLES &&
+        sampleSpan >= PROXIMITY_HOLD_MS &&
+        goodSamples / samples.length >= MIN_GOOD_RSSI_FRACTION;
+      const eligible = whitelisted && proximate;
+
+      const record = {
         id: id,
         name: (event.device && event.device.name) || "",
         rssi: event.rssi,
         uuids: event.uuids || [],
-        badge: isLikelyBadge(event)
-      });
+        badge: isLikelyBadge(event),
+        manufacturerId: manufacturerId,
+        whitelisted: whitelisted,
+        samples: samples,
+        closeSamples: goodSamples,
+        medianRssi: medianRssi,
+        proximate: proximate,
+        eligible: eligible,
+        btDevice: event.device
+      };
+      foundDevices.set(id, record);
+
+      if (eligible) {
+        eligibleDevice = event.device;
+        eligibleDeviceId = manufacturerId;
+        eligibleAt = now;
+        connectBtn.disabled = false;
+        setStatus(
+          "Eligibility passed for " + displayDeviceId(manufacturerId) +
+          ": whitelisted and close for 2 seconds.",
+          "ok"
+        );
+      } else if (eligibleDeviceId && eligibleDeviceId === manufacturerId && !proximate) {
+        eligibleDevice = null;
+        eligibleDeviceId = "";
+        eligibleAt = 0;
+        connectBtn.disabled = true;
+      }
       renderScanList();
     }
 
@@ -304,30 +822,16 @@
         return;
       }
       foundDevices.clear();
+      eligibleDevice = null;
+      eligibleDeviceId = "";
+      eligibleAt = 0;
+      connectBtn.disabled = true;
       renderScanList();
       scanBtn.disabled = true;
 
       if (typeof navigator.bluetooth.requestLEScan !== "function") {
-        setStatus("Live scan not supported here. Opening device picker as a Bluetooth check…");
-        try {
-          const picked = await navigator.bluetooth.requestDevice({
-            acceptAllDevices: true
-          });
-          foundDevices.set(picked.id || picked.name || "picked", {
-            id: picked.id || "",
-            name: picked.name || "(unnamed)",
-            rssi: null,
-            uuids: [],
-            badge: (picked.name || "").indexOf("V5000") >= 0
-          });
-          renderScanList();
-          setStatus("Bluetooth works. Picker listed devices; you selected one.", "ok");
-          log("Scan fallback", (picked.name || "") + " " + (picked.id || ""));
-        } catch (err) {
-          scanList.innerHTML = "<li class=\"empty\">Scan cancelled or Bluetooth failed.</li>";
-          setStatus(err.message || String(err), "err");
-          log("Scan failed", err.message || String(err));
-        }
+        scanList.innerHTML = "<li class=\"empty\">This browser cannot expose manufacturer data and RSSI. Eligibility checks cannot be completed. Enable test mode to connect through the browser chooser instead.</li>";
+        setStatus("Advertisement scanning is unsupported; provisioning fails closed.", "err");
         scanBtn.disabled = false;
         return;
       }
@@ -335,18 +839,39 @@
       try {
         setStatus("Scanning 5 seconds…");
         navigator.bluetooth.addEventListener("advertisementreceived", onAdvertisement);
-        scanHandle = await navigator.bluetooth.requestLEScan({
-          acceptAllAdvertisements: true,
-          keepRepeatedDevices: true
-        });
+        /*
+         * The badge splits its data: the companion service UUID rides in the
+         * advertisement, the V5000 manufacturer record only in the scan
+         * response. Match either one rather than requiring both in a single
+         * filter. Test mode listens to everything so an unknown badge's ID can
+         * be read off the list and pasted into the whitelist.
+         */
+        scanHandle = await navigator.bluetooth.requestLEScan(
+          testModeInput.checked
+            ? { acceptAllAdvertisements: true, keepRepeatedDevices: true }
+            : {
+                filters: [
+                  { services: [SERVICE] },
+                  {
+                    manufacturerData: [{
+                      companyIdentifier: VOCERA_COMPANY_ID,
+                      dataPrefix: new Uint8Array([0x56, 0x35, 0x30, 0x30, 0x30]) // "V5000"
+                    }]
+                  }
+                ],
+                keepRepeatedDevices: true
+              }
+        );
         scanTimer = setTimeout(() => {
           const n = foundDevices.size;
           stopScan();
           if (n === 0) {
             scanList.innerHTML = "<li class=\"empty\">Scan finished. No BLE advertisers heard.</li>";
             setStatus("Scan finished: 0 devices. Bluetooth may be off, or the browser blocked LE scan.", "err");
+          } else if (!eligibleDevice) {
+            setStatus("Scan finished: no badge passed whitelist and sustained proximity.", "err");
           } else {
-            setStatus("Scan finished: " + n + " device(s).", "ok");
+            setStatus("Eligible badge ready: " + displayDeviceId(eligibleDeviceId), "ok");
           }
           log("Scan finished", n + " device(s)");
         }, 5000);
@@ -358,9 +883,29 @@
       }
     }
 
+    /*
+     * The whitelist lives in localStorage so a hosted copy of this page can be
+     * retargeted at a badge without editing and redeploying the HTML.
+     */
+    whitelistInput.value = localStorage.getItem("mbu.whitelist") ||
+      WHITELISTED_DEVICE_IDS.join(", ");
+    whitelistInput.addEventListener("change", () => {
+      localStorage.setItem("mbu.whitelist", whitelistInput.value);
+    });
+    testModeInput.addEventListener("change", () => {
+      setConnected(!!characteristic);
+      if (testModeInput.checked) {
+        setStatus("Test mode on: eligibility checks bypassed, provisioning still needs authentication.", "err");
+      } else {
+        setStatus("Test mode off. Scan to re-establish eligibility.");
+      }
+    });
+
     connectBtn.addEventListener("click", connect);
     disconnectBtn.addEventListener("click", disconnect);
     scanBtn.addEventListener("click", scanFiveSeconds);
+    authBtn.addEventListener("click", authenticateCertificates);
+    provisionBtn.addEventListener("click", provisionHotspot);
     actionBtns.forEach((btn) => {
       btn.addEventListener("click", () => send(btn.dataset.action));
     });
