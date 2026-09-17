@@ -323,7 +323,7 @@
               optionalServices: [SERVICE]
             });
           } catch (err) {
-            if (err.name !== "TypeError") throw err;
+            if (err.name !== "TypeError" && err.name !== "NotSupportedError") throw err;
             /* Older engines reject manufacturerData filters outright. */
             log("Chooser", "Manufacturer data filter unsupported; falling back to service filter");
             device = await navigator.bluetooth.requestDevice({
@@ -344,7 +344,9 @@
         log("Connected", device.name || device.id);
       } catch (err) {
         setStatus(err.message || String(err), "err");
-        log("Connect failed", err.message || String(err));
+        log("Connect failed", err.name === "NotFoundError"
+          ? "Chooser closed with no match. If the badge is advertising, check SmartphoneBluetoothPairing=true."
+          : (err.message || String(err)));
       }
     }
 
@@ -931,6 +933,18 @@
     whitelistInput.addEventListener("change", () => {
       localStorage.setItem("mbu.whitelist", whitelistInput.value);
     });
+    /*
+     * requestLEScan is Chrome-only and flag-gated, so decide up front rather
+     * than making the user press Scan to discover the browser cannot do it.
+     */
+    if (navigator.bluetooth && typeof navigator.bluetooth.requestLEScan !== "function") {
+      scanUnsupported = true;
+      scanBtn.disabled = true;
+      connectBtn.disabled = false;
+      scanList.innerHTML = "<li class=\"empty\">This browser has no advertisement scanning. Use Connect; the chooser is filtered to the whitelisted ID.</li>";
+      setStatus("No advertisement scanning here. Connect through the filtered chooser.", "err");
+    }
+
     connectBtn.addEventListener("click", connect);
     disconnectBtn.addEventListener("click", disconnect);
     scanBtn.addEventListener("click", scanFiveSeconds);
