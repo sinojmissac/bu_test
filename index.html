@@ -119,6 +119,7 @@
     <button id="scan">Scan 5s</button>
     <button id="connect" disabled>Connect whitelisted badge</button>
     <button id="disconnect" class="ghost" disabled>Disconnect</button>
+    <button id="probe" class="ghost">List all devices</button>
   </div>
   <fieldset>
     <legend>Device eligibility</legend>
@@ -210,6 +211,7 @@
     const connectBtn = document.getElementById("connect");
     const disconnectBtn = document.getElementById("disconnect");
     const scanBtn = document.getElementById("scan");
+    const probeBtn = document.getElementById("probe");
     const scanList = document.getElementById("scan-list");
     const authBtn = document.getElementById("authenticate");
     const authStatusEl = document.getElementById("auth-status");
@@ -332,20 +334,66 @@
             });
           }
         }
-        device.addEventListener("gattserverdisconnected", onDisconnected);
-        setStatus("Connecting GATT…");
-        const server = await device.gatt.connect();
-        const service = await server.getPrimaryService(SERVICE);
-        characteristic = await service.getCharacteristic(CHAR);
-        await characteristic.startNotifications();
-        characteristic.addEventListener("characteristicvaluechanged", onNotify);
-        setConnected(true);
-        setStatus("Connected to " + (device.name || "V5000") + ". Start with Ping.", "ok");
-        log("Connected", device.name || device.id);
+        await attachToDevice(device);
       } catch (err) {
         setStatus(err.message || String(err), "err");
         log("Connect failed", err.name === "NotFoundError"
           ? "Chooser closed with no match. If the badge is advertising, check SmartphoneBluetoothPairing=true."
+          : (err.message || String(err)));
+      }
+    }
+
+    async function attachToDevice(dev) {
+      dev.addEventListener("gattserverdisconnected", onDisconnected);
+      setStatus("Connecting GATT…");
+      const server = await dev.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE);
+      characteristic = await service.getCharacteristic(CHAR);
+      await characteristic.startNotifications();
+      characteristic.addEventListener("characteristicvaluechanged", onNotify);
+      setConnected(true);
+      setStatus("Connected to " + (dev.name || "V5000") + ". Start with Ping.", "ok");
+      log("Connected", dev.name || dev.id);
+    }
+
+    /*
+     * An empty filtered chooser has two very different causes: the badge is not
+     * advertising the companion service, or the engine ignores manufacturer
+     * data filters. Listing every device separates them.
+     */
+    async function probeAllDevices() {
+      if (!navigator.bluetooth) {
+        setStatus("Web Bluetooth not available in this browser.", "err");
+        return;
+      }
+      try {
+        setStatus("Listing every nearby BLE device…");
+        const picked = await navigator.bluetooth.requestDevice({
+          acceptAllDevices: true,
+          optionalServices: [SERVICE]
+        });
+        log("Picked device", (picked.name || "(unnamed)") + " · id " + picked.id);
+        device = picked;
+        try {
+          await attachToDevice(picked);
+          setStatus(
+            "Connected, but identity was not proven by the whitelist. Verify with MBU basic info.",
+            "ok"
+          );
+        } catch (err) {
+          if (err.name !== "NotFoundError") throw err;
+          setStatus(
+            "That device has no companion service. The badge needs SmartphoneBluetoothPairing=true.",
+            "err"
+          );
+          log("Service missing", "GATT has no " + SERVICE + "; badge is advertising but not exposing MBU");
+          try { picked.gatt && picked.gatt.disconnect(); } catch (_) {}
+          device = null;
+        }
+      } catch (err) {
+        setStatus(err.message || String(err), "err");
+        log("Probe failed", err.name === "NotFoundError"
+          ? "No BLE devices offered at all, or the chooser was dismissed."
           : (err.message || String(err)));
       }
     }
@@ -948,6 +996,7 @@
     connectBtn.addEventListener("click", connect);
     disconnectBtn.addEventListener("click", disconnect);
     scanBtn.addEventListener("click", scanFiveSeconds);
+    probeBtn.addEventListener("click", probeAllDevices);
     authBtn.addEventListener("click", authenticateCertificates);
     provisionBtn.addEventListener("click", provisionHotspot);
     actionBtns.forEach((btn) => {
