@@ -114,7 +114,7 @@
 <body>
   <h1>V5000 MBU Test</h1>
   <div class="sub">Whitelist → connect → authenticate → provision hotspot (needs close-range proof)</div>
-  <div class="sub">Build <span id="build">ecdsa-3</span></div>
+  <div class="sub">Build <span id="build">ecdsa-4</span></div>
   <div id="status" class="status">Disconnected. Chrome on Android or desktop; iOS Safari has no Web Bluetooth.</div>
   <div class="row">
     <button id="scan">Scan 5s</button>
@@ -237,6 +237,7 @@
       badgeCertBase64: "",
       badgeCert: null,
       clientCertBase64: "",
+      clientCertAck: -1,
       clientKeyPem: "",
       caPem: "",
       clientKey: null,
@@ -270,9 +271,22 @@
       actionBtns.forEach((b) => { b.disabled = !on; });
     }
 
-    async function onNotify(event) {
-      const text = decoder.decode(event.target.value);
-      log("Notify", text);
+    /* Must match cBLAuthCertChunk on the badge; keeps each message near 166
+       bytes, inside a 182-byte notification/write on a default-MTU link. */
+    const CERT_CHUNK = 64;
+
+    let notifyChain = Promise.resolve();
+
+    /* Decode now and queue the text: characteristic.value is overwritten by the
+       next notification, and overlapping async handlers corrupt auth state. */
+    function onNotify(event) {
+      const raw = event.target.value;
+      const text = decoder.decode(raw);
+      log("Notify (" + raw.byteLength + " bytes)", text);
+      notifyChain = notifyChain.then(() => handleNotifyText(text));
+    }
+
+    async function handleNotifyText(text) {
       try {
         const json = JSON.parse(text);
         if ((json.action && json.action.indexOf("AUTH_") === 0) ||
@@ -423,6 +437,7 @@
 
     async function writeJson(payload) {
       if (!characteristic) throw new Error("Badge is not connected");
+      log("Write (" + encoder.encode(payload).length + " bytes)", payload);
       try {
         if (characteristic.writeValueWithResponse) {
           await characteristic.writeValueWithResponse(encoder.encode(payload));
@@ -451,6 +466,7 @@
       auth.badgeCertBase64 = "";
       auth.badgeCert = null;
       auth.clientCertBase64 = "";
+      auth.clientCertAck = -1;
       auth.clientKeyPem = "";
       auth.caPem = "";
       auth.clientKey = null;
@@ -701,7 +717,7 @@
     }
 
     async function sendClientCertChunk(offset) {
-      const chunk = auth.clientCertBase64.slice(offset, offset + 256);
+      const chunk = auth.clientCertBase64.slice(offset, offset + CERT_CHUNK);
       await writeJson(JSON.stringify({
         action: "AUTH_CLIENT_CERT",
         sessionId: auth.sessionId,
@@ -763,10 +779,23 @@
 
       if (message.action === "AUTH_BADGE_CERT") {
         if (message.sessionId !== auth.sessionId ||
-            message.offset !== auth.badgeCertBase64.length ||
             message.total !== auth.badgeCertLength ||
             typeof message.data !== "string") {
           throw new Error("Invalid badge certificate chunk");
+        }
+        const have = auth.badgeCertBase64.length;
+        if (message.offset < have) {
+          log("Ignoring duplicate badge certificate chunk",
+            "offset=" + message.offset + ", already have " + have + " of " + message.total);
+          return;
+        }
+        if (message.offset > have) {
+          throw new Error("Badge certificate gap: chunk starts at " + message.offset +
+            " but only " + have + " of " + message.total + " bytes received");
+        }
+        if (message.data.length === 0) {
+          throw new Error("Badge sent an empty certificate chunk at offset " + have +
+            " of " + message.total);
         }
         auth.badgeCertBase64 += message.data;
         if (auth.badgeCertBase64.length < auth.badgeCertLength) {
@@ -789,6 +818,12 @@
             message.nextOffset > auth.clientCertBase64.length) {
           throw new Error("Invalid client certificate acknowledgement");
         }
+        if (message.nextOffset <= auth.clientCertAck) {
+          log("Ignoring duplicate client certificate ack",
+            "nextOffset=" + message.nextOffset + ", already acked " + auth.clientCertAck);
+          return;
+        }
+        auth.clientCertAck = message.nextOffset;
         if (message.nextOffset < auth.clientCertBase64.length) {
           await sendClientCertChunk(message.nextOffset);
           return;
@@ -942,6 +977,7 @@
         auth.active = true;
         auth.authenticated = false;
         provisionBtn.disabled = true;
+        auth.clientCertAck = -1;
         auth.clientNonce = randomBase64(32);
         setAuthStatus("Starting certificate authentication…");
         await writeJson(JSON.stringify({
