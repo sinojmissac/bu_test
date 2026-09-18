@@ -142,17 +142,17 @@
   </fieldset>
   <fieldset>
     <legend>Certificate authentication</legend>
-    <label class="file">Client certificate (PEM)
+    <label class="file">Client certificate (PEM, ECDSA P-256)
       <input id="client-cert" type="file" accept=".pem,.crt,.cer" />
     </label>
-    <label class="file">Client RSA private key (unencrypted PEM)
+    <label class="file">Client P-256 private key (unencrypted PKCS#8 PEM)
       <input id="client-key" type="file" accept=".pem,.key" />
     </label>
-    <label><input id="verify-badge" type="checkbox" /> Verify badge certificate against CA</label>
+    <label><input id="verify-badge" type="checkbox" checked /> Verify badge certificate against CA</label>
     <label class="file">Trusted badge CA (PEM; required when verification is checked)
       <input id="badge-ca" type="file" accept=".pem,.crt,.cer" />
     </label>
-    <div id="auth-status" class="auth-status">Connect first, then authenticate.</div>
+    <div id="auth-status" class="auth-status">Connect first. Bundled certs in certs/ are used if you do not pick files.</div>
     <button id="authenticate" disabled>Authenticate certificates</button>
   </fieldset>
   <pre id="log">Ready.</pre>
@@ -162,6 +162,11 @@
     still shows up in a generic scan but cannot be connected.
     Whitelisted IDs entered above are saved in this browser; the
     <code>WHITELISTED_DEVICE_IDS</code> constant is only the default.
+    For GitHub Pages, keep <code>index.html</code> and the <code>certs/</code>
+    folder together at the site root:
+    <code>certs/client.pem</code>, <code>certs/client.key</code>,
+    <code>certs/root_ca.pem</code>. Those are development credentials only;
+    do not publish <code>root_ca.key</code> or the badge private key.
     Web Bluetooth needs HTTPS or localhost. Scan 5s uses the experimental BLE
     advertisement scan API. Chrome may need
     <code>chrome://flags/#enable-experimental-web-platform-features</code>.
@@ -170,12 +175,6 @@
     close-range proof, so hotspot provisioning stays blocked there.
   </p>
 
-  <!-- Forge supplies X.509 parsing/validation for this test harness. Production
-       apps should vendor and pin their crypto dependency. -->
-  <script
-    src="https://cdn.jsdelivr.net/npm/node-forge@1.3.1/dist/forge.min.js"
-    integrity="sha384-xE6n3RBMZWgwAhyzoIMfY7HN3oDBa/+HBwFFNyxsdY8kseup7C4Blx1yDzprEESV"
-    crossorigin="anonymous"></script>
   <script>
     const SERVICE = "ef16b600-9c17-455c-819a-4ce618569300";
     const CHAR = "ef16b601-9c17-455c-819a-4ce618569300";
@@ -237,7 +236,11 @@
       badgeCertBase64: "",
       badgeCert: null,
       clientCertBase64: "",
-      clientKeyPem: ""
+      clientKeyPem: "",
+      caPem: "",
+      clientKey: null,
+      badgeVerifyKey: null,
+      badgeEcdhKey: null
     };
 
     function setStatus(text, kind) {
@@ -444,6 +447,10 @@
       auth.badgeCert = null;
       auth.clientCertBase64 = "";
       auth.clientKeyPem = "";
+      auth.caPem = "";
+      auth.clientKey = null;
+      auth.badgeVerifyKey = null;
+      auth.badgeEcdhKey = null;
       provisionBtn.disabled = true;
       setAuthStatus("Connect first, then authenticate.");
     }
@@ -454,26 +461,139 @@
       return btoa(binary);
     }
 
+    function base64ToBytes(b64) {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
+
+    function concatBytes(a, b) {
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a, 0);
+      out.set(b, a.length);
+      return out;
+    }
+
     function randomBase64(length) {
       const bytes = new Uint8Array(length);
       crypto.getRandomValues(bytes);
       return bytesToBase64(bytes);
     }
 
-    function pemBody(pem, label) {
-      const begin = "-----BEGIN " + label + "-----";
-      const end = "-----END " + label + "-----";
-      const start = pem.indexOf(begin);
-      const finish = pem.indexOf(end);
-      if (start < 0 || finish < 0 || finish <= start) {
-        throw new Error("Expected PEM block: " + label);
+    function pemBody(pem, labels) {
+      const names = Array.isArray(labels) ? labels : [labels];
+      for (let n = 0; n < names.length; n++) {
+        const begin = "-----BEGIN " + names[n] + "-----";
+        const end = "-----END " + names[n] + "-----";
+        const start = pem.indexOf(begin);
+        const finish = pem.indexOf(end);
+        if (start >= 0 && finish > start) {
+          return pem.slice(start + begin.length, finish).replace(/\s/g, "");
+        }
       }
-      return pem.slice(start + begin.length, finish).replace(/\s/g, "");
+      throw new Error("Expected PEM block: " + names.join(" or "));
     }
 
-    function certificateFromBase64(base64) {
-      const der = forge.util.decode64(base64);
-      return forge.pki.certificateFromAsn1(forge.asn1.fromDer(der));
+    function readDerLen(bytes, i) {
+      let n = bytes[i++];
+      if ((n & 0x80) === 0) return { len: n, i: i };
+      const count = n & 0x7f;
+      n = 0;
+      for (let k = 0; k < count; k++) n = (n << 8) | bytes[i++];
+      return { len: n, i: i };
+    }
+
+    function parseTlv(bytes, i) {
+      const tagStart = i;
+      const tag = bytes[i++];
+      const L = readDerLen(bytes, i);
+      return { tag: tag, tagStart: tagStart, start: L.i, end: L.i + L.len, next: L.i + L.len };
+    }
+
+    function derSlice(bytes, tlv) {
+      return bytes.subarray(tlv.tagStart, tlv.next);
+    }
+
+    function parseSequenceChildren(bytes) {
+      const seq = parseTlv(bytes, 0);
+      if (seq.tag !== 0x30) throw new Error("Expected ASN.1 SEQUENCE");
+      const kids = [];
+      let i = seq.start;
+      while (i < seq.end) {
+        const kid = parseTlv(bytes, i);
+        kids.push(kid);
+        i = kid.next;
+      }
+      return kids;
+    }
+
+    function extractSpki(certDer) {
+      const certKids = parseSequenceChildren(certDer);
+      const tbs = parseSequenceChildren(derSlice(certDer, certKids[0]));
+      const spkiIndex = tbs[0].tag === 0xa0 ? 6 : 5;
+      if (!tbs[spkiIndex]) throw new Error("Certificate is missing subjectPublicKeyInfo");
+      return derSlice(certDer, tbs[spkiIndex]);
+    }
+
+    function extractTbsAndSignature(certDer) {
+      const certKids = parseSequenceChildren(certDer);
+      if (certKids.length < 3) throw new Error("Malformed certificate");
+      const tbs = derSlice(certDer, certKids[0]);
+      const sigTlv = parseTlv(certDer, certKids[2].tagStart);
+      let i = sigTlv.start;
+      const unused = certDer[i++];
+      if (unused !== 0) throw new Error("Unsupported BIT STRING padding in certificate signature");
+      return { tbs: tbs, signature: certDer.subarray(i, sigTlv.end) };
+    }
+
+    function derIntegerToCoord(bytes, tlv, coordLen) {
+      let v = bytes.subarray(tlv.start, tlv.end);
+      while (v.length > 0 && v[0] === 0) v = v.subarray(1);
+      if (v.length > coordLen) throw new Error("ECDSA coordinate is too large");
+      const out = new Uint8Array(coordLen);
+      out.set(v, coordLen - v.length);
+      return out;
+    }
+
+    function derEcdsaToRaw(der, coordLen) {
+      const kids = parseSequenceChildren(der);
+      if (kids.length !== 2) throw new Error("Invalid ECDSA signature");
+      return concatBytes(
+        derIntegerToCoord(der, kids[0], coordLen),
+        derIntegerToCoord(der, kids[1], coordLen)
+      );
+    }
+
+    function rawEcdsaToDer(raw) {
+      const coordLen = raw.length / 2;
+      function intDer(coord) {
+        let v = coord;
+        while (v.length > 1 && v[0] === 0) v = v.subarray(1);
+        if (v[0] & 0x80) v = concatBytes(new Uint8Array([0]), v);
+        const header = new Uint8Array(2);
+        header[0] = 0x02;
+        header[1] = v.length;
+        return concatBytes(header, v);
+      }
+      const body = concatBytes(intDer(raw.subarray(0, coordLen)), intDer(raw.subarray(coordLen)));
+      const seq = new Uint8Array(2 + body.length);
+      seq[0] = 0x30;
+      seq[1] = body.length;
+      seq.set(body, 2);
+      return seq;
+    }
+
+    async function importP256Key(format, der, usages, name) {
+      return crypto.subtle.importKey(format, der, { name: name, namedCurve: "P-256" }, false, usages);
+    }
+
+    async function keysFromCertificate(certDer) {
+      const spki = extractSpki(certDer);
+      return {
+        verify: await importP256Key("spki", spki, ["verify"], "ECDSA"),
+        ecdh: await importP256Key("spki", spki, [], "ECDH")
+      };
     }
 
     function transcript() {
@@ -482,34 +602,44 @@
         "\nbadgeNonce=" + auth.badgeNonce;
     }
 
+    async function verifySignedByCa(certDer, caPem) {
+      const caDer = base64ToBytes(pemBody(caPem, "CERTIFICATE"));
+      const caKeys = await keysFromCertificate(caDer);
+      const parsed = extractTbsAndSignature(certDer);
+      const raw = derEcdsaToRaw(parsed.signature, 32);
+      const ok = await crypto.subtle.verify(
+        { name: "ECDSA", hash: "SHA-256" },
+        caKeys.verify,
+        raw,
+        parsed.tbs
+      );
+      if (!ok) throw new Error("Certificate is not signed by the selected CA");
+    }
+
     async function verifyBadgeCertificate() {
       if (!verifyBadgeInput.checked) return;
-      const caFile = badgeCaInput.files[0];
-      if (!caFile) throw new Error("Select the trusted badge CA certificate");
-      const caPem = await caFile.text();
-      const store = forge.pki.createCaStore([caPem]);
-      forge.pki.verifyCertificateChain(store, [auth.badgeCert]);
+      if (!auth.caPem) throw new Error("Select or deploy the trusted badge CA certificate");
+      await verifySignedByCa(auth.badgeCert, auth.caPem);
     }
 
-    function signTranscript() {
-      let key;
-      try {
-        key = forge.pki.privateKeyFromPem(auth.clientKeyPem);
-      } catch (_) {
-        throw new Error("Client key must be an unencrypted RSA PEM key");
-      }
-      const md = forge.md.sha256.create();
-      md.update(transcript(), "utf8");
-      return forge.util.encode64(key.sign(md));
+    async function signTranscript() {
+      const raw = new Uint8Array(await crypto.subtle.sign(
+        { name: "ECDSA", hash: "SHA-256" },
+        auth.clientKey,
+        encoder.encode(transcript())
+      ));
+      return bytesToBase64(rawEcdsaToDer(raw));
     }
 
-    function verifyBadgeProof(signatureBase64) {
-      const md = forge.md.sha256.create();
-      md.update(transcript(), "utf8");
-      const signature = forge.util.decode64(signatureBase64);
-      if (!auth.badgeCert.publicKey.verify(md.digest().bytes(), signature)) {
-        throw new Error("Badge signature is invalid");
-      }
+    async function verifyBadgeProof(signatureBase64) {
+      const raw = derEcdsaToRaw(base64ToBytes(signatureBase64), 32);
+      const ok = await crypto.subtle.verify(
+        { name: "ECDSA", hash: "SHA-256" },
+        auth.badgeVerifyKey,
+        raw,
+        encoder.encode(transcript())
+      );
+      if (!ok) throw new Error("Badge signature is invalid");
     }
 
     async function requestBadgeCert(offset) {
@@ -593,7 +723,10 @@
           return;
         }
 
-        auth.badgeCert = certificateFromBase64(auth.badgeCertBase64);
+        auth.badgeCert = base64ToBytes(auth.badgeCertBase64);
+        const badgeKeys = await keysFromCertificate(auth.badgeCert);
+        auth.badgeVerifyKey = badgeKeys.verify;
+        auth.badgeEcdhKey = badgeKeys.ecdh;
         await verifyBadgeCertificate();
         setAuthStatus("Badge proof key loaded. Sending client certificate…");
         await sendClientCertChunk(0);
@@ -615,7 +748,7 @@
         await writeJson(JSON.stringify({
           action: "AUTH_PROVE",
           sessionId: auth.sessionId,
-          signature: signTranscript()
+          signature: await signTranscript()
         }));
         return;
       }
@@ -624,7 +757,7 @@
         if (message.sessionId !== auth.sessionId || message.status !== "ok" || !message.signature) {
           throw new Error("Badge rejected authentication");
         }
-        verifyBadgeProof(message.signature);
+        await verifyBadgeProof(message.signature);
         auth.active = false;
         auth.authenticated = true;
         provisionBtn.disabled = false;
@@ -660,19 +793,31 @@
       }
 
       try {
-        const plaintext = JSON.stringify({ ssid: ssid, password: password });
-        const publicKey = auth.badgeCert.publicKey;
-        if (!publicKey || typeof publicKey.encrypt !== "function") {
-          throw new Error("Hotspot provisioning requires an RSA badge certificate");
-        }
-        const ciphertext = publicKey.encrypt(plaintext, "RSA-OAEP", {
-          md: forge.md.sha256.create(),
-          mgf1: { md: forge.md.sha256.create() }
-        });
+        const plaintext = encoder.encode(JSON.stringify({ ssid: ssid, password: password }));
+        const eph = await crypto.subtle.generateKey(
+          { name: "ECDH", namedCurve: "P-256" },
+          true,
+          ["deriveBits"]
+        );
+        const ephPub = new Uint8Array(await crypto.subtle.exportKey("raw", eph.publicKey));
+        const shared = new Uint8Array(await crypto.subtle.deriveBits(
+          { name: "ECDH", public: auth.badgeEcdhKey },
+          eph.privateKey,
+          256
+        ));
+        const wrapBits = await crypto.subtle.digest(
+          "SHA-256",
+          concatBytes(shared, encoder.encode("MBU-HOTSPOT-ECDH-V1"))
+        );
+        const wrapKey = await crypto.subtle.importKey("raw", wrapBits, "AES-GCM", false, ["encrypt"]);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, wrapKey, plaintext));
         const payload = JSON.stringify({
           action: "HOTSPOT_PROVISION",
           sessionId: auth.sessionId,
-          ciphertext: forge.util.encode64(ciphertext)
+          ephPub: bytesToBase64(ephPub),
+          iv: bytesToBase64(iv),
+          ciphertext: bytesToBase64(ciphertext)
         });
         if (encoder.encode(payload).length >= 495) {
           throw new Error("Encrypted provisioning message exceeds the BLE transport limit");
@@ -685,36 +830,51 @@
       }
     }
 
-    async function authenticateCertificates() {
-      if (!window.forge) {
-        setAuthStatus("X.509 library failed to load. Check internet access to jsDelivr.", false);
-        return;
+    async function loadPemText(input, url, label) {
+      if (input && input.files && input.files[0]) {
+        return input.files[0].text();
       }
-      const certFile = clientCertInput.files[0];
-      const keyFile = clientKeyInput.files[0];
-      if (!certFile || !keyFile) {
-        setAuthStatus("Select a client certificate and private key.", false);
+      const response = await fetch(url, { cache: "no-cache" });
+      if (!response.ok) {
+        throw new Error("Could not load " + label + " from " + url +
+          ". Select a file, or deploy certs/ next to index.html.");
+      }
+      return response.text();
+    }
+
+    async function authenticateCertificates() {
+      if (!window.crypto || !crypto.subtle) {
+        setAuthStatus("Web Crypto is unavailable in this browser.", false);
         return;
       }
 
       try {
-        const certPem = await certFile.text();
-        auth.clientKeyPem = await keyFile.text();
+        const certPem = await loadPemText(clientCertInput, "certs/client.pem", "client certificate");
+        auth.clientKeyPem = await loadPemText(clientKeyInput, "certs/client.key", "client key");
+        auth.caPem = verifyBadgeInput.checked
+          ? await loadPemText(badgeCaInput, "certs/root_ca.pem", "trusted CA")
+          : "";
         auth.clientCertBase64 = pemBody(certPem, "CERTIFICATE");
         if (auth.clientCertBase64.length > 6144) {
           throw new Error("Client certificate exceeds the 6144-byte protocol limit");
         }
-        /* Parse and match both files before sending anything, to fail early. */
-        const clientCert = certificateFromBase64(auth.clientCertBase64);
-        const clientKey = forge.pki.privateKeyFromPem(auth.clientKeyPem);
-        const testMd = forge.md.sha256.create();
-        testMd.update("MBU client key check", "utf8");
-        const testSignature = clientKey.sign(testMd);
-        const verifyMd = forge.md.sha256.create();
-        verifyMd.update("MBU client key check", "utf8");
-        if (!clientCert.publicKey.verify(verifyMd.digest().bytes(), testSignature)) {
-          throw new Error("Client certificate and private key do not match");
-        }
+        const clientCertDer = base64ToBytes(auth.clientCertBase64);
+        const clientKeys = await keysFromCertificate(clientCertDer);
+        const pkcs8 = base64ToBytes(pemBody(auth.clientKeyPem, ["PRIVATE KEY", "EC PRIVATE KEY"]));
+        auth.clientKey = await importP256Key("pkcs8", pkcs8, ["sign"], "ECDSA");
+        const probe = encoder.encode("MBU client key check");
+        const rawSig = new Uint8Array(await crypto.subtle.sign(
+          { name: "ECDSA", hash: "SHA-256" },
+          auth.clientKey,
+          probe
+        ));
+        const matched = await crypto.subtle.verify(
+          { name: "ECDSA", hash: "SHA-256" },
+          clientKeys.verify,
+          rawSig,
+          probe
+        );
+        if (!matched) throw new Error("Client certificate and private key do not match");
 
         auth.active = true;
         auth.authenticated = false;
