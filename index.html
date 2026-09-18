@@ -114,7 +114,7 @@
 <body>
   <h1>V5000 MBU Test</h1>
   <div class="sub">Whitelist → connect → authenticate → provision hotspot (needs close-range proof)</div>
-  <div class="sub">Build <span id="build">ecdsa-4</span></div>
+  <div class="sub">Build <span id="build">ecdsa-5</span></div>
   <div id="status" class="status">Disconnected. Chrome on Android or desktop; iOS Safari has no Web Bluetooth.</div>
   <div class="row">
     <button id="scan">Scan 5s</button>
@@ -276,6 +276,7 @@
     const CERT_CHUNK = 64;
 
     let notifyChain = Promise.resolve();
+    let writeWithoutResponse = false;
 
     /* Decode now and queue the text: characteristic.value is overwritten by the
        next notification, and overlapping async handlers corrupt auth state. */
@@ -371,6 +372,10 @@
       const server = await dev.gatt.connect();
       const service = await server.getPrimaryService(SERVICE);
       characteristic = await service.getCharacteristic(CHAR);
+      const props = characteristic.properties || {};
+      writeWithoutResponse = !!props.writeWithoutResponse;
+      log("Characteristic properties", Object.keys(props)
+        .filter((k) => props[k] === true).join(", ") || "not reported");
       await characteristic.startNotifications();
       characteristic.addEventListener("characteristicvaluechanged", onNotify);
       setConnected(true);
@@ -439,10 +444,19 @@
       if (!characteristic) throw new Error("Badge is not connected");
       log("Write (" + encoder.encode(payload).length + " bytes)", payload);
       try {
-        if (characteristic.writeValueWithResponse) {
-          await characteristic.writeValueWithResponse(encoder.encode(payload));
+        const bytes = encoder.encode(payload);
+        /*
+         * Prefer write-without-response. The badge has no way to answer an ATT
+         * Write Request (the gateway protocol has no write-response command), so
+         * a Write Request is retransmitted until it times out and the badge
+         * processes the same message several times.
+         */
+        if (writeWithoutResponse && characteristic.writeValueWithoutResponse) {
+          await characteristic.writeValueWithoutResponse(bytes);
+        } else if (characteristic.writeValueWithResponse) {
+          await characteristic.writeValueWithResponse(bytes);
         } else {
-          await characteristic.writeValue(encoder.encode(payload));
+          await characteristic.writeValue(bytes);
         }
       } catch (err) {
         setStatus(err.message || String(err), "err");
@@ -762,11 +776,28 @@
 
       if (!auth.active) return;
 
+      /*
+       * Leftovers from a superseded session are not errors. Dropping them keeps
+       * one duplicated request from tearing down a handshake that is still fine.
+       */
+      if (auth.sessionId && message.sessionId && message.sessionId !== auth.sessionId &&
+          message.action !== "AUTH_CHALLENGE") {
+        log("Ignoring message from stale session",
+          message.action + " session=" + message.sessionId + ", current=" + auth.sessionId);
+        return;
+      }
+
       if (message.action === "AUTH_CHALLENGE") {
         if (message.protocol !== "MBU-BLE-AUTH-V1" ||
             !message.sessionId || !message.badgeNonce ||
             message.certificateLength <= 0 || message.certificateLength > 6144) {
           throw new Error("Invalid badge authentication challenge");
+        }
+        if (auth.sessionId && message.sessionId !== auth.sessionId) {
+          /* The badge only re-challenges if it saw another AUTH_BEGIN. */
+          log("Badge issued a new challenge", "replacing session " + auth.sessionId +
+            " with " + message.sessionId + " after " + auth.badgeCertBase64.length +
+            " certificate bytes");
         }
         auth.sessionId = message.sessionId;
         auth.badgeNonce = message.badgeNonce;
