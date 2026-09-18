@@ -511,8 +511,9 @@
       return { tag: tag, tagStart: tagStart, start: L.i, end: L.i + L.len, next: L.i + L.len };
     }
 
+    /* Returns a copy so the result can be re-parsed from offset 0. */
     function derSlice(bytes, tlv) {
-      return bytes.subarray(tlv.tagStart, tlv.next);
+      return bytes.slice(tlv.tagStart, tlv.next);
     }
 
     function parseSequenceChildren(bytes) {
@@ -530,10 +531,12 @@
 
     function extractSpki(certDer) {
       const certKids = parseSequenceChildren(certDer);
-      const tbs = parseSequenceChildren(derSlice(certDer, certKids[0]));
+      /* tbs offsets are relative to the tbs bytes, so slice from those. */
+      const tbsBytes = derSlice(certDer, certKids[0]);
+      const tbs = parseSequenceChildren(tbsBytes);
       const spkiIndex = tbs[0].tag === 0xa0 ? 6 : 5;
       if (!tbs[spkiIndex]) throw new Error("Certificate is missing subjectPublicKeyInfo");
-      return derSlice(certDer, tbs[spkiIndex]);
+      return derSlice(tbsBytes, tbs[spkiIndex]);
     }
 
     function extractTbsAndSignature(certDer) {
