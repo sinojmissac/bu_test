@@ -114,6 +114,7 @@
 <body>
   <h1>V5000 MBU Test</h1>
   <div class="sub">Whitelist → connect → authenticate → provision hotspot (needs close-range proof)</div>
+  <div class="sub">Build <span id="build">ecdsa-3</span></div>
   <div id="status" class="status">Disconnected. Chrome on Android or desktop; iOS Safari has no Web Bluetooth.</div>
   <div class="row">
     <button id="scan">Scan 5s</button>
@@ -248,13 +249,17 @@
       statusEl.className = "status" + (kind ? " " + kind : "");
     }
 
+    /* Appends, so a multi-step failure keeps the steps that led up to it. */
     function log(label, data) {
       const time = new Date().toISOString().slice(11, 19);
       let body = data;
       if (typeof data === "string") {
         try { body = JSON.stringify(JSON.parse(data), null, 2); } catch (_) {}
       }
-      logEl.textContent = `[${time}] ${label}\n${body}`;
+      const entry = `[${time}] ${label}\n${body}`;
+      const lines = (logEl.textContent + "\n" + entry).split("\n");
+      logEl.textContent = lines.slice(Math.max(0, lines.length - 120)).join("\n");
+      logEl.scrollTop = logEl.scrollHeight;
     }
 
     function setConnected(on) {
@@ -587,16 +592,57 @@
       return seq;
     }
 
+    function derLength(n) {
+      if (n < 0x80) return new Uint8Array([n]);
+      if (n < 0x100) return new Uint8Array([0x81, n]);
+      return new Uint8Array([0x82, (n >> 8) & 0xff, n & 0xff]);
+    }
+
+    function derWrap(tag, content) {
+      return concatBytes(concatBytes(new Uint8Array([tag]), derLength(content.length)), content);
+    }
+
+    /* AlgorithmIdentifier for id-ecPublicKey + prime256v1. */
+    const P256_ALG_ID = new Uint8Array([
+      0x30, 0x13,
+      0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+      0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07
+    ]);
+
+    /* Web Crypto imports PKCS#8 only, so wrap a SEC1 "EC PRIVATE KEY" body. */
+    function sec1ToPkcs8(sec1) {
+      const body = concatBytes(
+        concatBytes(new Uint8Array([0x02, 0x01, 0x00]), P256_ALG_ID),
+        derWrap(0x04, sec1)
+      );
+      return derWrap(0x30, body);
+    }
+
     async function importP256Key(format, der, usages, name) {
       return crypto.subtle.importKey(format, der, { name: name, namedCurve: "P-256" }, false, usages);
     }
 
-    async function keysFromCertificate(certDer) {
+    /* Web Crypto errors name no operation, so label each step for the log. */
+    async function step(label, run) {
+      try {
+        return await run();
+      } catch (err) {
+        const detail = (err && (err.message || err.name)) || String(err);
+        throw new Error(label + " failed: " + detail);
+      }
+    }
+
+    async function verifyKeyFromCertificate(certDer, label) {
+      const spki = await step("Parsing " + label, async () => extractSpki(certDer));
+      log("Parsed " + label, spki.length + "-byte SPKI, " + certDer.length + "-byte cert");
+      return step("Importing " + label + " public key",
+        () => importP256Key("spki", spki, ["verify"], "ECDSA"));
+    }
+
+    async function ecdhKeyFromCertificate(certDer) {
       const spki = extractSpki(certDer);
-      return {
-        verify: await importP256Key("spki", spki, ["verify"], "ECDSA"),
-        ecdh: await importP256Key("spki", spki, [], "ECDH")
-      };
+      return step("Importing badge key agreement key",
+        () => importP256Key("spki", spki, [], "ECDH"));
     }
 
     function transcript() {
@@ -607,15 +653,17 @@
 
     async function verifySignedByCa(certDer, caPem) {
       const caDer = base64ToBytes(pemBody(caPem, "CERTIFICATE"));
-      const caKeys = await keysFromCertificate(caDer);
-      const parsed = extractTbsAndSignature(certDer);
-      const raw = derEcdsaToRaw(parsed.signature, 32);
-      const ok = await crypto.subtle.verify(
+      const caKey = await verifyKeyFromCertificate(caDer, "CA certificate");
+      const parsed = await step("Splitting badge certificate signature",
+        async () => extractTbsAndSignature(certDer));
+      const raw = await step("Decoding badge certificate signature",
+        async () => derEcdsaToRaw(parsed.signature, 32));
+      const ok = await step("Verifying badge certificate against CA", () => crypto.subtle.verify(
         { name: "ECDSA", hash: "SHA-256" },
-        caKeys.verify,
+        caKey,
         raw,
         parsed.tbs
-      );
+      ));
       if (!ok) throw new Error("Certificate is not signed by the selected CA");
     }
 
@@ -727,9 +775,8 @@
         }
 
         auth.badgeCert = base64ToBytes(auth.badgeCertBase64);
-        const badgeKeys = await keysFromCertificate(auth.badgeCert);
-        auth.badgeVerifyKey = badgeKeys.verify;
-        auth.badgeEcdhKey = badgeKeys.ecdh;
+        auth.badgeVerifyKey = await verifyKeyFromCertificate(auth.badgeCert, "badge certificate");
+        auth.badgeEcdhKey = null;
         await verifyBadgeCertificate();
         setAuthStatus("Badge proof key loaded. Sending client certificate…");
         await sendClientCertChunk(0);
@@ -803,6 +850,9 @@
           ["deriveBits"]
         );
         const ephPub = new Uint8Array(await crypto.subtle.exportKey("raw", eph.publicKey));
+        if (!auth.badgeEcdhKey) {
+          auth.badgeEcdhKey = await ecdhKeyFromCertificate(auth.badgeCert);
+        }
         const shared = new Uint8Array(await crypto.subtle.deriveBits(
           { name: "ECDH", public: auth.badgeEcdhKey },
           eph.privateKey,
@@ -835,6 +885,7 @@
 
     async function loadPemText(input, url, label) {
       if (input && input.files && input.files[0]) {
+        log("Loaded " + label, "picked file " + input.files[0].name);
         return input.files[0].text();
       }
       const response = await fetch(url, { cache: "no-cache" });
@@ -842,7 +893,9 @@
         throw new Error("Could not load " + label + " from " + url +
           ". Select a file, or deploy certs/ next to index.html.");
       }
-      return response.text();
+      const text = await response.text();
+      log("Loaded " + label, url + " (" + text.length + " bytes from repo)");
+      return text;
     }
 
     async function authenticateCertificates() {
@@ -862,21 +915,28 @@
           throw new Error("Client certificate exceeds the 6144-byte protocol limit");
         }
         const clientCertDer = base64ToBytes(auth.clientCertBase64);
-        const clientKeys = await keysFromCertificate(clientCertDer);
-        const pkcs8 = base64ToBytes(pemBody(auth.clientKeyPem, ["PRIVATE KEY", "EC PRIVATE KEY"]));
-        auth.clientKey = await importP256Key("pkcs8", pkcs8, ["sign"], "ECDSA");
+        const clientVerifyKey = await verifyKeyFromCertificate(clientCertDer, "client certificate");
+
+        const isSec1 = auth.clientKeyPem.indexOf("-----BEGIN EC PRIVATE KEY-----") >= 0 &&
+          auth.clientKeyPem.indexOf("-----BEGIN PRIVATE KEY-----") < 0;
+        let keyDer = base64ToBytes(pemBody(auth.clientKeyPem, ["PRIVATE KEY", "EC PRIVATE KEY"]));
+        if (isSec1) keyDer = sec1ToPkcs8(keyDer);
+        log("Parsed client key", (isSec1 ? "SEC1 wrapped to PKCS#8, " : "PKCS#8, ") + keyDer.length + " bytes");
+        auth.clientKey = await step("Importing client private key",
+          () => importP256Key("pkcs8", keyDer, ["sign"], "ECDSA"));
+
         const probe = encoder.encode("MBU client key check");
-        const rawSig = new Uint8Array(await crypto.subtle.sign(
+        const rawSig = new Uint8Array(await step("Signing key-match probe", () => crypto.subtle.sign(
           { name: "ECDSA", hash: "SHA-256" },
           auth.clientKey,
           probe
-        ));
-        const matched = await crypto.subtle.verify(
+        )));
+        const matched = await step("Verifying key-match probe", () => crypto.subtle.verify(
           { name: "ECDSA", hash: "SHA-256" },
-          clientKeys.verify,
+          clientVerifyKey,
           rawSig,
           probe
-        );
+        ));
         if (!matched) throw new Error("Client certificate and private key do not match");
 
         auth.active = true;
