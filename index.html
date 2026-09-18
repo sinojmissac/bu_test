@@ -114,7 +114,7 @@
 <body>
   <h1>V5000 MBU Test</h1>
   <div class="sub">Whitelist → connect → authenticate → provision hotspot (needs close-range proof)</div>
-  <div class="sub">Build <span id="build">ecdsa-5</span></div>
+  <div class="sub">Build <span id="build">ecdsa-6</span></div>
   <div id="status" class="status">Disconnected. Chrome on Android or desktop; iOS Safari has no Web Bluetooth.</div>
   <div class="row">
     <button id="scan">Scan 5s</button>
@@ -271,9 +271,8 @@
       actionBtns.forEach((b) => { b.disabled = !on; });
     }
 
-    /* Must match cBLAuthCertChunk on the badge; keeps each message near 166
-       bytes, inside a 182-byte notification/write on a default-MTU link. */
-    const CERT_CHUNK = 64;
+    /* Must match cBLAuthCertChunk on the badge. Gateway MTU is 517. */
+    const CERT_CHUNK = 256;
 
     let notifyChain = Promise.resolve();
     let writeWithoutResponse = false;
